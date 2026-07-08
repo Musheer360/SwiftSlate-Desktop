@@ -1,0 +1,73 @@
+name: Bug Report
+description: Something isn't working as expected in SwiftSlate Desktop
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! Please fill in the details below so I can reproduce and fix the issue.
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Affected Component
+      options:
+        - Trigger detection (keystrokes not recognized)
+        - Text replacement (wrong text / no replacement)
+        - AI Commands (API errors / no response)
+        - Text Replacer Commands
+        - Clipboard operations
+        - Spinner animation
+        - Installation / Update
+        - Configuration / Hot reload
+        - Startup / Shutdown
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      placeholder: Describe the bug clearly. What did you expect vs what actually happened?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open Notepad
+        2. Type "hello ?fix"
+        3. Observe: nothing happens / wrong result
+    validations:
+      required: true
+
+  - type: dropdown
+    id: provider
+    attributes:
+      label: AI Provider (if relevant)
+      options:
+        - Groq
+        - Google Gemini
+        - Custom (OpenAI-compatible)
+        - Not applicable
+    validations:
+      required: false
+
+  - type: input
+    id: system
+    attributes:
+      label: Windows version & Python version
+      placeholder: "e.g., Windows 11 23H2, Python 3.12.7 (embedded)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      placeholder: Debug log output, screenshots, or anything else relevant. Run with --debug flag to get logs.
+    validations:
+      required: false
