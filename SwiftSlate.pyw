@@ -96,7 +96,7 @@ hwnd_main = None
 
 # Provider settings
 provider = "groq"  # groq, gemini, custom
-temperature = 0.3
+temperature = 0.5
 custom_endpoint = ""
 
 # Key management (round-robin with rate-limit tracking)
@@ -153,7 +153,7 @@ def load_config():
     model = config.get("model", "llama-3.3-70b-versatile")
     prefix = config.get("prefix", "?")
     provider = config.get("provider", "groq")
-    temperature = config.get("temperature", 0.3)
+    temperature = config.get("temperature", 0.5)
     custom_endpoint = config.get("endpoint", "")
     translate_prefix = prefix + "translate:"
 

@@ -177,7 +177,7 @@ if (-not (Test-Path $configPath)) {
 
     if ([string]::IsNullOrWhiteSpace($apiKey)) { Write-Host "  No API key." -ForegroundColor Red; return }
 
-    $cfg = @{ api_keys = @($apiKey); model = $model; provider = $provider; temperature = 0.3; prefix = "?" }
+    $cfg = @{ api_keys = @($apiKey); model = $model; provider = $provider; temperature = 0.5; prefix = "?" }
     if ($endpoint) { $cfg.endpoint = $endpoint }
     [System.IO.File]::WriteAllText($configPath, ($cfg | ConvertTo-Json -Depth 3), (New-Object System.Text.UTF8Encoding $false))
 }
