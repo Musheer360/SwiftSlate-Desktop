@@ -1,13 +1,22 @@
 # SwiftSlate Desktop
 # https://github.com/Musheer360/SwiftSlate-Desktop
-# irm https://raw.githubusercontent.com/Musheer360/SwiftSlate-Desktop/master/install.ps1 | iex
+# irm https://cdn.jsdelivr.net/gh/Musheer360/SwiftSlate-Desktop@master/install.ps1 | iex
 
 $installDir = Join-Path $env:USERPROFILE ".swiftslate"
 $runtimeDir = Join-Path $installDir "runtime"
 $startupDir = [Environment]::GetFolderPath("Startup")
 $shortcutPath = Join-Path $startupDir "SwiftSlate Desktop.lnk"
 $isInstalled = Test-Path (Join-Path $installDir "SwiftSlate.pyw")
-$repo = "https://raw.githubusercontent.com/Musheer360/SwiftSlate-Desktop/master"
+$repo = "https://cdn.jsdelivr.net/gh/Musheer360/SwiftSlate-Desktop@master"
+$repoFallback = "https://raw.githubusercontent.com/Musheer360/SwiftSlate-Desktop/master"
+
+# --- Helper: download with CDN fallback ---
+function Get-File {
+    param([string]$File, [string]$OutFile)
+    try { Invoke-WebRequest -Uri "$repo/$File" -OutFile $OutFile -UseBasicParsing; return $true } catch {}
+    try { Invoke-WebRequest -Uri "$repoFallback/$File" -OutFile $OutFile -UseBasicParsing; return $true } catch {}
+    return $false
+}
 $pythonVersion = "3.12.7"
 $pythonZipUrl = "https://www.python.org/ftp/python/$pythonVersion/python-$pythonVersion-embed-amd64.zip"
 
@@ -107,7 +116,7 @@ if (-not $pythonwExe) {
 # --- Download (to temp first, then move — prevents partial overwrites) ---
 Write-Host "  Downloading..." -ForegroundColor DarkGray
 $tempPyw = Join-Path $env:TEMP "SwiftSlate.pyw.tmp"
-try { Invoke-WebRequest -Uri "$repo/SwiftSlate.pyw" -OutFile $tempPyw -UseBasicParsing } catch {
+if (-not (Get-File "SwiftSlate.pyw" $tempPyw)) {
     Write-Host "  Download failed." -ForegroundColor Red; return
 }
 Move-Item -Path $tempPyw -Destination (Join-Path $installDir "SwiftSlate.pyw") -Force
@@ -115,7 +124,7 @@ Move-Item -Path $tempPyw -Destination (Join-Path $installDir "SwiftSlate.pyw") -
 # Only download commands.json on fresh install (preserve user customizations on update)
 $commandsPath = Join-Path $installDir "commands.json"
 if (-not (Test-Path $commandsPath)) {
-    try { Invoke-WebRequest -Uri "$repo/commands.json" -OutFile $commandsPath -UseBasicParsing } catch {
+    if (-not (Get-File "commands.json" $commandsPath)) {
         Write-Host "  Download failed." -ForegroundColor Red; return
     }
 }
