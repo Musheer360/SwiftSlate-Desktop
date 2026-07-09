@@ -36,8 +36,8 @@ if ($isInstalled) {
         Write-Host ""
         Write-Host "  Uninstalled." -ForegroundColor Green
         Write-Host ""
-        exit 0
-    } elseif ($action -ne "1") { exit 0 }
+        return
+    } elseif ($action -ne "1") { return }
     Write-Host ""
 }
 
@@ -69,30 +69,30 @@ if (-not $pythonwExe) {
     $zipPath = Join-Path $env:TEMP "python-embed.zip"
     try { Invoke-WebRequest -Uri $pythonZipUrl -OutFile $zipPath -UseBasicParsing } catch {
         Write-Host "  Failed to download Python. Install Python 3.10+ manually: python.org/downloads" -ForegroundColor Red
-        exit 1
+        return
     }
     if (-not (Test-Path $runtimeDir)) { New-Item -ItemType Directory -Path $runtimeDir -Force | Out-Null }
     try { Expand-Archive -Path $zipPath -DestinationPath $runtimeDir -Force } catch {
         Write-Host "  Failed to extract Python runtime." -ForegroundColor Red
-        exit 1
+        return
     }
     Remove-Item $zipPath -Force -EA SilentlyContinue
     $pythonwExe = Join-Path $runtimeDir "pythonw.exe"
     $pythonExe = Join-Path $runtimeDir "python.exe"
-    if (-not (Test-Path $pythonwExe)) { Write-Host "  Python setup failed." -ForegroundColor Red; exit 1 }
+    if (-not (Test-Path $pythonwExe)) { Write-Host "  Python setup failed." -ForegroundColor Red; return }
     Write-Host "  Python runtime ready." -ForegroundColor DarkGray
 }
 
 # --- Download ---
 Write-Host "  Downloading..." -ForegroundColor DarkGray
 try { Invoke-WebRequest -Uri "$repo/SwiftSlate.pyw" -OutFile (Join-Path $installDir "SwiftSlate.pyw") -UseBasicParsing } catch {
-    Write-Host "  Download failed." -ForegroundColor Red; exit 1
+    Write-Host "  Download failed." -ForegroundColor Red; return
 }
 # Only download commands.json on fresh install (preserve user customizations on update)
 $commandsPath = Join-Path $installDir "commands.json"
 if (-not (Test-Path $commandsPath)) {
     try { Invoke-WebRequest -Uri "$repo/commands.json" -OutFile $commandsPath -UseBasicParsing } catch {
-        Write-Host "  Download failed." -ForegroundColor Red; exit 1
+        Write-Host "  Download failed." -ForegroundColor Red; return
     }
 }
 
@@ -151,7 +151,7 @@ if (-not (Test-Path $configPath)) {
         }
     }
 
-    if ([string]::IsNullOrWhiteSpace($apiKey)) { Write-Host "  No API key." -ForegroundColor Red; exit 1 }
+    if ([string]::IsNullOrWhiteSpace($apiKey)) { Write-Host "  No API key." -ForegroundColor Red; return }
 
     $cfg = @{ api_keys = @($apiKey); model = $model; provider = $provider; temperature = 0.3; prefix = "?" }
     if ($endpoint) { $cfg.endpoint = $endpoint }
