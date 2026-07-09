@@ -68,15 +68,19 @@ if (-not $pythonwExe) {
     Write-Host "  Downloading Python runtime..." -ForegroundColor DarkGray
     $zipPath = Join-Path $env:TEMP "python-embed.zip"
     try { Invoke-WebRequest -Uri $pythonZipUrl -OutFile $zipPath -UseBasicParsing } catch {
-        Write-Host "  Failed. Install Python 3.10+ manually: python.org/downloads" -ForegroundColor Red
+        Write-Host "  Failed to download Python. Install Python 3.10+ manually: python.org/downloads" -ForegroundColor Red
         exit 1
     }
     if (-not (Test-Path $runtimeDir)) { New-Item -ItemType Directory -Path $runtimeDir -Force | Out-Null }
-    Expand-Archive -Path $zipPath -DestinationPath $runtimeDir -Force
-    Remove-Item $zipPath -Force
+    try { Expand-Archive -Path $zipPath -DestinationPath $runtimeDir -Force } catch {
+        Write-Host "  Failed to extract Python runtime." -ForegroundColor Red
+        exit 1
+    }
+    Remove-Item $zipPath -Force -EA SilentlyContinue
     $pythonwExe = Join-Path $runtimeDir "pythonw.exe"
     $pythonExe = Join-Path $runtimeDir "python.exe"
     if (-not (Test-Path $pythonwExe)) { Write-Host "  Python setup failed." -ForegroundColor Red; exit 1 }
+    Write-Host "  Python runtime ready." -ForegroundColor DarkGray
 }
 
 # --- Download ---
