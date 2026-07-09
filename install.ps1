@@ -20,6 +20,7 @@ function Get-File {
     $urls = @("$repo/$File", "$repoFallback/$File")
     foreach ($url in $urls) {
         try {
+            # Try Invoke-WebRequest first (standard approach)
             Invoke-WebRequest -Uri $url -OutFile $OutFile -UseBasicParsing -TimeoutSec 30
             if (Test-Path $OutFile) { return $true }
         } catch {
@@ -32,6 +33,13 @@ function Get-File {
                 Write-Host "        $err" -ForegroundColor DarkGray
             }
         }
+    }
+    # Retry with .NET WebClient (bypasses PowerShell cmdlet issues)
+    foreach ($url in $urls) {
+        try {
+            (New-Object Net.WebClient).DownloadFile($url, $OutFile)
+            if (Test-Path $OutFile) { return $true }
+        } catch {}
     }
     # Last resort: GitHub Contents API (different rate limit pool, returns base64)
     try {
@@ -145,16 +153,23 @@ if (-not $pythonwExe) {
 
 # --- Download (to temp first, then move — prevents partial overwrites) ---
 Write-Host "  Downloading..." -ForegroundColor DarkGray
-$tempPyw = Join-Path $env:TEMP "SwiftSlate.pyw.tmp"
+# Use .tmp extension (not .pyw.tmp) to avoid AV flagging Python file in temp
+$tempPyw = Join-Path $env:TEMP "swiftslate-download.tmp"
 if (-not (Get-File "SwiftSlate.pyw" $tempPyw)) {
-    Write-Host ""
-    Write-Host "  Download failed. Try:" -ForegroundColor Red
-    Write-Host "  1. Check your internet connection" -ForegroundColor DarkGray
-    Write-Host "  2. Download manually from: https://github.com/Musheer360/SwiftSlate-Desktop" -ForegroundColor DarkGray
-    Write-Host ""
-    return
+    # Fallback: try downloading directly to install dir
+    $directPath = Join-Path $installDir "SwiftSlate.pyw"
+    if (-not (Get-File "SwiftSlate.pyw" $directPath)) {
+        Write-Host ""
+        Write-Host "  Download failed. Try:" -ForegroundColor Red
+        Write-Host "  1. Check your internet connection" -ForegroundColor DarkGray
+        Write-Host "  2. Temporarily disable antivirus and retry" -ForegroundColor DarkGray
+        Write-Host "  3. Download manually from: https://github.com/Musheer360/SwiftSlate-Desktop" -ForegroundColor DarkGray
+        Write-Host ""
+        return
+    }
+} else {
+    Move-Item -Path $tempPyw -Destination (Join-Path $installDir "SwiftSlate.pyw") -Force
 }
-Move-Item -Path $tempPyw -Destination (Join-Path $installDir "SwiftSlate.pyw") -Force
 
 # Only download commands.json on fresh install (preserve user customizations on update)
 $commandsPath = Join-Path $installDir "commands.json"
