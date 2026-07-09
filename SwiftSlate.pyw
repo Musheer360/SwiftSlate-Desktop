@@ -236,7 +236,10 @@ def _start_file_watcher():
                     changed = True
 
                 if changed and not processing:
-                    # Update mtimes only after successful reload
+                    # Reload into temp state, then swap atomically
+                    old_commands = dict(commands)
+                    old_triggers = dict(trigger_strings)
+                    old_last_chars = set(trigger_last_chars)
                     commands.clear()
                     trigger_strings.clear()
                     trigger_last_chars.clear()
@@ -247,7 +250,11 @@ def _start_file_watcher():
                         _commands_mtime = cm
                         log("Hot reload: config/commands reloaded")
                     else:
-                        log("Hot reload: config invalid, keeping previous state")
+                        # Restore previous working state
+                        commands.update(old_commands)
+                        trigger_strings.update(old_triggers)
+                        trigger_last_chars.update(old_last_chars)
+                        log("Hot reload: config invalid, restored previous state")
                 elif changed and processing:
                     # Don't update mtimes — retry on next tick
                     log("Hot reload: deferred (processing)")
@@ -367,11 +374,9 @@ def call_api(text, prompt):
             log(f"Attempt {attempt+1}/{max_attempts}: {err_type} - {e}")
 
             if err_type == ERR_NETWORK:
-                # Retry once after 1s for transient network errors
-                if attempt == 0:
-                    time.sleep(1)
-                    continue
-                break
+                # Wait 1s then try next key (network may recover)
+                time.sleep(1)
+                continue
             else:
                 break
 
@@ -447,7 +452,11 @@ def _call_openai_compatible(text, system_content, key, endpoint):
     # Let exceptions propagate to call_api retry loop
     with urllib.request.urlopen(req, timeout=30) as resp:
         data = json.loads(resp.read().decode("utf-8"))
-        return data["choices"][0]["message"]["content"].strip()
+        try:
+            return data["choices"][0]["message"]["content"].strip()
+        except (KeyError, IndexError, TypeError):
+            log(f"Malformed API response: {list(data.keys())}")
+            return None
 
 # --- Clipboard (silent, no history pollution) ---
 def set_clipboard_silent(text):
@@ -670,6 +679,8 @@ def do_transform(trigger_name, prompt):
             if user32.GetForegroundWindow() != hwnd:
                 log("Window changed, waiting silently")
                 window_changed = True
+                # Restore original text in field before leaving (remove spinner char)
+                paste_text(input_text)
                 done_event.wait()
                 break
             spinner = spinner_frames[frame % 4]
@@ -691,12 +702,16 @@ def do_transform(trigger_name, prompt):
                 log("Result placed on clipboard (user was typing)")
             else:
                 log("API returned nothing after abort")
+            # Don't restore prev_clip — leave result on clipboard for user to paste
+            prev_clip = None
         elif user32.GetForegroundWindow() == hwnd:
             paste_text(result if result else input_text)
         else:
             # Window not focused - put result on clipboard for manual paste
             set_clipboard_silent(result if result else input_text)
             log("Result on clipboard (window not focused)")
+            # Don't restore prev_clip — leave result available
+            prev_clip = None
     finally:
         # Always restore clipboard and release processing
         time.sleep(0.2)
