@@ -320,8 +320,23 @@ def classify_error(e, http_code=None):
     return ERR_OTHER
 
 # --- API call with retry ---
+def _check_network():
+    """Quick network connectivity check — raw TCP connect to known DNS servers.
+    No DNS resolution, no TLS, no HTTP — just checks if we can reach the internet.
+    Returns in <3s worst case."""
+    import socket
+    for host in ("1.1.1.1", "8.8.8.8"):
+        try:
+            sock = socket.create_connection((host, 53), timeout=1.5)
+            sock.close()
+            return True
+        except (OSError, socket.timeout):
+            continue
+    return False
+
 def call_api(text, prompt):
-    """Call API with key rotation and retry on transient errors."""
+    """Call API with key rotation and retry on transient errors.
+    On network/timeout failures, checks connectivity first before retrying."""
     system_content = SYSTEM_PROMPT_PREFIX + prompt
     max_attempts = max(len(api_keys), 1)
     last_error = None
@@ -374,8 +389,13 @@ def call_api(text, prompt):
             log(f"Attempt {attempt+1}/{max_attempts}: {err_type} - {e}")
 
             if err_type == ERR_NETWORK:
-                # Wait 1s then try next key (network may recover)
-                time.sleep(1)
+                # Network failed — check if internet is even reachable
+                log("Network error — checking connectivity...")
+                if not _check_network():
+                    log("No internet — aborting retries")
+                    break
+                # Network is fine — problem is provider-side, try next key
+                log("Network OK — retrying with next key")
                 continue
             else:
                 break
@@ -411,7 +431,7 @@ def _call_gemini(text, system_content, key):
     }, method="POST")
 
     # Let exceptions propagate to call_api retry loop
-    with urllib.request.urlopen(req, timeout=30) as resp:
+    with urllib.request.urlopen(req, timeout=20) as resp:
         data = json.loads(resp.read().decode("utf-8"))
         candidates = data.get("candidates", [])
         if candidates:
@@ -450,7 +470,7 @@ def _call_openai_compatible(text, system_content, key, endpoint):
     }, method="POST")
 
     # Let exceptions propagate to call_api retry loop
-    with urllib.request.urlopen(req, timeout=30) as resp:
+    with urllib.request.urlopen(req, timeout=20) as resp:
         data = json.loads(resp.read().decode("utf-8"))
         try:
             return data["choices"][0]["message"]["content"].strip()
@@ -460,24 +480,25 @@ def _call_openai_compatible(text, system_content, key, endpoint):
 
 # --- Clipboard (silent, no history pollution) ---
 def set_clipboard_silent(text):
+    """Set clipboard text, excluding from history. Returns True on success."""
     if not user32.OpenClipboard(None):
-        return
+        return False
     try:
         user32.EmptyClipboard()
         # Set text as CF_UNICODETEXT
         data = (text + "\0").encode("utf-16-le")
         hmem = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(data))
         if not hmem:
-            return
+            return False
         ptr = kernel32.GlobalLock(hmem)
         if not ptr:
             kernel32.GlobalFree(hmem)
-            return
+            return False
         ctypes.memmove(ptr, data, len(data))
         kernel32.GlobalUnlock(hmem)
         if not user32.SetClipboardData(CF_UNICODETEXT, hmem):
             kernel32.GlobalFree(hmem)
-            return
+            return False
 
         # Exclusion flags
         for fmt, val in [(cf_exclude, 1), (cf_no_history, 0), (cf_no_cloud, 0)]:
@@ -492,6 +513,7 @@ def set_clipboard_silent(text):
                             kernel32.GlobalFree(h)
                     else:
                         kernel32.GlobalFree(h)
+        return True
     finally:
         user32.CloseClipboard()
 
@@ -541,6 +563,10 @@ KEYEVENTF_KEYUP = 0x0002
 VK_CONTROL = 0x11
 _KEY_MAP = {"a": 0x41, "c": 0x43, "v": 0x56}
 
+# Magic value to tag self-generated keystrokes (so Raw Input hook ignores them)
+# dwExtraInfo is ULONG_PTR — we store an integer that gets passed through to RAWKEYBOARD.ExtraInformation
+_SELF_INPUT_TAG = 0x53534B  # "SSK" = SwiftSlate Keystroke
+
 def _make_key(vk, flags=0):
     inp = INPUT()
     inp.type = INPUT_KEYBOARD
@@ -548,7 +574,8 @@ def _make_key(vk, flags=0):
     inp.union.ki.wScan = 0
     inp.union.ki.dwFlags = flags
     inp.union.ki.time = 0
-    inp.union.ki.dwExtraInfo = None
+    # Cast integer to POINTER(ULONG) — Windows treats dwExtraInfo as an opaque ULONG_PTR
+    inp.union.ki.dwExtraInfo = ctypes.cast(ctypes.c_void_p(_SELF_INPUT_TAG), ctypes.POINTER(wt.ULONG))
     return inp
 
 def send_keys(keys):
@@ -607,8 +634,10 @@ def grab_field_text():
 
 # --- Paste text into active field ---
 def paste_text(text):
-    """Select all and paste text into the active field."""
+    """Select all and paste text into the active field. Returns True on success."""
     fg = user32.GetForegroundWindow()
+    if not fg:
+        return False
     fg_tid = user32.GetWindowThreadProcessId(fg, None)
     our_tid = kernel32.GetCurrentThreadId()
     attached = False
@@ -616,14 +645,27 @@ def paste_text(text):
         attached = user32.AttachThreadInput(our_tid, fg_tid, True)
 
     try:
-        set_clipboard_silent(text)
+        if not set_clipboard_silent(text):
+            return False
         time.sleep(0.02)
         send_keys("^a")
         time.sleep(0.02)
         send_keys("^v")
+        return True
     finally:
         if attached:
             user32.AttachThreadInput(our_tid, fg_tid, False)
+
+# --- Retry paste (ensures text gets into the field even if clipboard is contested) ---
+def _retry_paste(text, max_retries=5):
+    """Attempt to paste text, retrying if clipboard is locked."""
+    for i in range(max_retries):
+        if paste_text(text):
+            return True
+        log(f"Retry paste attempt {i+1}/{max_retries} failed")
+        time.sleep(0.1)  # Wait a bit for clipboard to free up
+    log("All retry paste attempts failed")
+    return False
 
 # --- Transform (AI command) ---
 def do_transform(trigger_name, prompt):
@@ -665,12 +707,22 @@ def do_transform(trigger_name, prompt):
         threading.Thread(target=api_thread, daemon=True).start()
 
         # Spinner animation (200ms per frame)
+        # Hard cap: 45 seconds total — if API hasn't responded, give up
+        MAX_SPINNER_SECONDS = 45
         frame = 0
         window_changed = False
         aborted = False
+        timed_out = False
         abort_event.clear()
+        spinner_start = time.time()
+        consecutive_paste_failures = 0
 
         while not done_event.is_set():
+            # Hard timeout — don't spin forever
+            if (time.time() - spinner_start) > MAX_SPINNER_SECONDS:
+                log("Spinner timed out — API took too long")
+                timed_out = True
+                break
             # User typed during processing — abort spinner, preserve their input
             if abort_event.is_set():
                 log("Spinner aborted — user is typing")
@@ -681,10 +733,19 @@ def do_transform(trigger_name, prompt):
                 window_changed = True
                 # Restore original text in field before leaving (remove spinner char)
                 paste_text(input_text)
-                done_event.wait()
+                done_event.wait(timeout=MAX_SPINNER_SECONDS)
                 break
             spinner = spinner_frames[frame % 4]
-            paste_text(input_text + " " + spinner)
+            if paste_text(input_text + " " + spinner):
+                consecutive_paste_failures = 0
+            else:
+                consecutive_paste_failures += 1
+                log(f"Spinner paste failed ({consecutive_paste_failures})")
+                # If clipboard is locked for too long, bail out
+                if consecutive_paste_failures >= 10:
+                    log("Too many paste failures — aborting spinner")
+                    timed_out = True
+                    break
             frame += 1
             done_event.wait(timeout=0.2)
 
@@ -692,7 +753,13 @@ def do_transform(trigger_name, prompt):
         result = result_holder[0]
         log(f"Result: {len(result) if result else 0} chars")
 
-        if aborted:
+        if timed_out:
+            # API took too long or paste kept failing — restore the original text
+            log("Timed out — restoring original text")
+            if user32.GetForegroundWindow() == hwnd:
+                _retry_paste(input_text)
+            prev_clip = None
+        elif aborted:
             # User started typing — don't overwrite. Wait for API result silently
             # and put it on clipboard so they can paste when ready
             done_event.wait(timeout=30)
@@ -705,7 +772,14 @@ def do_transform(trigger_name, prompt):
             # Don't restore prev_clip — leave result on clipboard for user to paste
             prev_clip = None
         elif user32.GetForegroundWindow() == hwnd:
-            paste_text(result if result else input_text)
+            # Small delay to ensure last spinner paste settled
+            time.sleep(0.05)
+            if result:
+                _retry_paste(result)
+            else:
+                # API failed — restore original text (remove spinner)
+                log("API returned nothing — restoring original text")
+                _retry_paste(input_text)
         else:
             # Window not focused - put result on clipboard for manual paste
             set_clipboard_silent(result if result else input_text)
@@ -957,7 +1031,10 @@ def wnd_proc(hwnd, msg, wparam, lparam):
             if user32.GetRawInputData(lparam, RID_INPUT, buf, ctypes.byref(dw_size), ctypes.sizeof(RAWINPUTHEADER)) == dw_size.value:
                 raw = ctypes.cast(buf, ctypes.POINTER(RAWINPUT)).contents
                 if raw.header.dwType == RIM_TYPEKEYBOARD:
-                    if raw.keyboard.Message == WM_KEYDOWN or raw.keyboard.Message == WM_SYSKEYDOWN:
+                    # Skip self-generated keystrokes (from our own SendInput)
+                    if raw.keyboard.ExtraInformation == _SELF_INPUT_TAG:
+                        pass
+                    elif raw.keyboard.Message == WM_KEYDOWN or raw.keyboard.Message == WM_SYSKEYDOWN:
                         process_keystroke(raw.keyboard.VKey, raw.keyboard.MakeCode)
 
     elif msg == WM_DESTROY:
