@@ -4,12 +4,22 @@
 
 $installDir = Join-Path $env:USERPROFILE ".swiftslate"
 $runtimeDir = Join-Path $installDir "runtime"
-$startupDir = [System.IO.Path]::Combine($env:APPDATA, "Microsoft\Windows\Start Menu\Programs\Startup")
+$startupDir = [Environment]::GetFolderPath("Startup")
 $shortcutPath = Join-Path $startupDir "SwiftSlate Desktop.lnk"
 $isInstalled = Test-Path (Join-Path $installDir "SwiftSlate.pyw")
 $repo = "https://raw.githubusercontent.com/Musheer360/SwiftSlate-Desktop/master"
 $pythonVersion = "3.12.7"
 $pythonZipUrl = "https://www.python.org/ftp/python/$pythonVersion/python-$pythonVersion-embed-amd64.zip"
+
+# --- Helper: kill running SwiftSlate instances ---
+function Stop-SwiftSlate {
+    Get-Process pythonw, python -ErrorAction SilentlyContinue | ForEach-Object {
+        try { $cmd = (Get-CimInstance Win32_Process -Filter "ProcessId = $($_.Id)" -EA SilentlyContinue).CommandLine
+            if ($cmd -like "*SwiftSlate*") { Stop-Process -Id $_.Id -Force -EA SilentlyContinue }
+        } catch {}
+    }
+    Start-Sleep -Milliseconds 500
+}
 
 Write-Host ""
 Write-Host "  SwiftSlate Desktop" -ForegroundColor Cyan
@@ -26,18 +36,27 @@ if ($isInstalled) {
     $action = Read-Host "  Choice"
 
     if ($action -eq "2") {
-        Get-Process pythonw, python -ErrorAction SilentlyContinue | ForEach-Object {
-            try { $cmd = (Get-CimInstance Win32_Process -Filter "ProcessId = $($_.Id)" -EA SilentlyContinue).CommandLine
-                if ($cmd -like "*SwiftSlate*") { Stop-Process -Id $_.Id -Force -EA SilentlyContinue }
-            } catch {}
+        $confirm = Read-Host "  Remove all data including config and commands? [y/N]"
+        if ($confirm -ne "y" -and $confirm -ne "Y") {
+            Write-Host "  Cancelled." -ForegroundColor DarkGray
+            Write-Host ""
+            return
         }
+        Stop-SwiftSlate
         if (Test-Path $shortcutPath) { Remove-Item $shortcutPath -Force }
         if (Test-Path $installDir) { Remove-Item $installDir -Recurse -Force }
         Write-Host ""
         Write-Host "  Uninstalled." -ForegroundColor Green
         Write-Host ""
         return
-    } elseif ($action -ne "1") { return }
+    } elseif ($action -ne "1") {
+        Write-Host "  Cancelled." -ForegroundColor DarkGray
+        Write-Host ""
+        return
+    }
+
+    # Update: kill running instance before replacing files
+    Stop-SwiftSlate
     Write-Host ""
 }
 
@@ -58,8 +77,10 @@ if ($sysPython) {
     }
 }
 
+# Check embedded runtime — validate it has essential files
 $embeddedPythonw = Join-Path $runtimeDir "pythonw.exe"
-if (Test-Path $embeddedPythonw) {
+$embeddedDll = Join-Path $runtimeDir "python312.dll"
+if ((Test-Path $embeddedPythonw) -and (Test-Path $embeddedDll)) {
     $pythonwExe = $embeddedPythonw
     $pythonExe = Join-Path $runtimeDir "python.exe"
 }
@@ -83,11 +104,14 @@ if (-not $pythonwExe) {
     Write-Host "  Python runtime ready." -ForegroundColor DarkGray
 }
 
-# --- Download ---
+# --- Download (to temp first, then move — prevents partial overwrites) ---
 Write-Host "  Downloading..." -ForegroundColor DarkGray
-try { Invoke-WebRequest -Uri "$repo/SwiftSlate.pyw" -OutFile (Join-Path $installDir "SwiftSlate.pyw") -UseBasicParsing } catch {
+$tempPyw = Join-Path $env:TEMP "SwiftSlate.pyw.tmp"
+try { Invoke-WebRequest -Uri "$repo/SwiftSlate.pyw" -OutFile $tempPyw -UseBasicParsing } catch {
     Write-Host "  Download failed." -ForegroundColor Red; return
 }
+Move-Item -Path $tempPyw -Destination (Join-Path $installDir "SwiftSlate.pyw") -Force
+
 # Only download commands.json on fresh install (preserve user customizations on update)
 $commandsPath = Join-Path $installDir "commands.json"
 if (-not (Test-Path $commandsPath)) {
@@ -158,7 +182,7 @@ if (-not (Test-Path $configPath)) {
     [System.IO.File]::WriteAllText($configPath, ($cfg | ConvertTo-Json -Depth 3), (New-Object System.Text.UTF8Encoding $false))
 }
 
-# --- Startup ---
+# --- Startup shortcut (create or update) ---
 if (-not $isInstalled) {
     Write-Host ""
     $su = Read-Host "  Start on login? [Y/n]"
@@ -171,11 +195,25 @@ if (-not $isInstalled) {
         $sc.Description = "SwiftSlate Desktop"
         $sc.Save()
     }
+} elseif (Test-Path $shortcutPath) {
+    # Update: ensure shortcut points to current pythonwExe
+    $sh = New-Object -ComObject WScript.Shell
+    $sc = $sh.CreateShortcut($shortcutPath)
+    if ($sc.TargetPath -ne $pythonwExe) {
+        $sc.TargetPath = $pythonwExe
+        $sc.Arguments = "`"$(Join-Path $installDir 'SwiftSlate.pyw')`""
+        $sc.WorkingDirectory = $installDir
+        $sc.Save()
+    }
 }
 
 # --- Done ---
 Write-Host ""
-Write-Host "  Done. Type a trigger (e.g. ?fix) in any app." -ForegroundColor Green
+if ($isInstalled) {
+    Write-Host "  Updated." -ForegroundColor Green
+} else {
+    Write-Host "  Installed." -ForegroundColor Green
+}
 Write-Host ""
 Write-Host "  Config:   $installDir\config.json" -ForegroundColor DarkGray
 Write-Host "  Commands: $installDir\commands.json" -ForegroundColor DarkGray
@@ -183,13 +221,7 @@ Write-Host ""
 
 $start = Read-Host "  Start now? [Y/n]"
 if ($start -ne "n" -and $start -ne "N") {
-    # Kill any existing instance first
-    Get-Process pythonw, python -ErrorAction SilentlyContinue | ForEach-Object {
-        try { $cmd = (Get-CimInstance Win32_Process -Filter "ProcessId = $($_.Id)" -EA SilentlyContinue).CommandLine
-            if ($cmd -like "*SwiftSlate*") { Stop-Process -Id $_.Id -Force -EA SilentlyContinue }
-        } catch {}
-    }
-    Start-Sleep -Milliseconds 500
+    Stop-SwiftSlate
     Start-Process $pythonwExe -ArgumentList "`"$(Join-Path $installDir 'SwiftSlate.pyw')`"" -WorkingDirectory $installDir
     Write-Host "  Started." -ForegroundColor Green
 }
