@@ -9,12 +9,42 @@ $shortcutPath = Join-Path $startupDir "SwiftSlate Desktop.lnk"
 $isInstalled = Test-Path (Join-Path $installDir "SwiftSlate.pyw")
 $repo = "https://cdn.jsdelivr.net/gh/Musheer360/SwiftSlate-Desktop@master"
 $repoFallback = "https://raw.githubusercontent.com/Musheer360/SwiftSlate-Desktop/master"
+$repoApi = "https://api.github.com/repos/Musheer360/SwiftSlate-Desktop/contents"
+
+# Ensure TLS 1.2+ (older Windows/PowerShell may default to TLS 1.0 which many CDNs reject)
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
 
 # --- Helper: download with CDN fallback ---
 function Get-File {
     param([string]$File, [string]$OutFile)
-    try { Invoke-WebRequest -Uri "$repo/$File" -OutFile $OutFile -UseBasicParsing; return $true } catch {}
-    try { Invoke-WebRequest -Uri "$repoFallback/$File" -OutFile $OutFile -UseBasicParsing; return $true } catch {}
+    $urls = @("$repo/$File", "$repoFallback/$File")
+    foreach ($url in $urls) {
+        try {
+            Invoke-WebRequest -Uri $url -OutFile $OutFile -UseBasicParsing -TimeoutSec 30
+            if (Test-Path $OutFile) { return $true }
+        } catch {
+            $err = $_.Exception.Message
+            if ($_.Exception.Response) {
+                $code = [int]$_.Exception.Response.StatusCode
+                Write-Host "  [$code] $url" -ForegroundColor DarkGray
+            } else {
+                Write-Host "  [ERR] $url" -ForegroundColor DarkGray
+                Write-Host "        $err" -ForegroundColor DarkGray
+            }
+        }
+    }
+    # Last resort: GitHub Contents API (different rate limit pool, returns base64)
+    try {
+        $resp = Invoke-RestMethod -Uri "$repoApi/$File" -UseBasicParsing -TimeoutSec 30
+        if ($resp.content) {
+            $bytes = [Convert]::FromBase64String($resp.content)
+            [IO.File]::WriteAllBytes($OutFile, $bytes)
+            if (Test-Path $OutFile) { return $true }
+        }
+    } catch {
+        $err = $_.Exception.Message
+        Write-Host "  [API] $err" -ForegroundColor DarkGray
+    }
     return $false
 }
 $pythonVersion = "3.12.7"
@@ -117,7 +147,12 @@ if (-not $pythonwExe) {
 Write-Host "  Downloading..." -ForegroundColor DarkGray
 $tempPyw = Join-Path $env:TEMP "SwiftSlate.pyw.tmp"
 if (-not (Get-File "SwiftSlate.pyw" $tempPyw)) {
-    Write-Host "  Download failed." -ForegroundColor Red; return
+    Write-Host ""
+    Write-Host "  Download failed. Try:" -ForegroundColor Red
+    Write-Host "  1. Check your internet connection" -ForegroundColor DarkGray
+    Write-Host "  2. Download manually from: https://github.com/Musheer360/SwiftSlate-Desktop" -ForegroundColor DarkGray
+    Write-Host ""
+    return
 }
 Move-Item -Path $tempPyw -Destination (Join-Path $installDir "SwiftSlate.pyw") -Force
 
@@ -125,7 +160,12 @@ Move-Item -Path $tempPyw -Destination (Join-Path $installDir "SwiftSlate.pyw") -
 $commandsPath = Join-Path $installDir "commands.json"
 if (-not (Test-Path $commandsPath)) {
     if (-not (Get-File "commands.json" $commandsPath)) {
-        Write-Host "  Download failed." -ForegroundColor Red; return
+        Write-Host ""
+        Write-Host "  Download failed. Try:" -ForegroundColor Red
+        Write-Host "  1. Check your internet connection" -ForegroundColor DarkGray
+        Write-Host "  2. Download manually from: https://github.com/Musheer360/SwiftSlate-Desktop" -ForegroundColor DarkGray
+        Write-Host ""
+        return
     }
 }
 
