@@ -26,11 +26,28 @@ RIM_TYPEKEYBOARD = 1
 GMEM_MOVEABLE = 0x0002
 CF_UNICODETEXT = 13
 WS_OVERLAPPEDWINDOW = 0x00CF0000
-CW_USEDEFAULT = 0x80000000
+CW_USEDEFAULT = -2147483648  # 0x80000000 as signed c_int
+
+# Notification constants
+NIM_ADD = 0x00000000
+NIM_MODIFY = 0x00000001
+NIM_DELETE = 0x00000002
+NIM_SETVERSION = 0x00000004
+NIF_ICON = 0x00000002
+NIF_TIP = 0x00000004
+NIF_INFO = 0x00000010
+NIF_SHOWTIP = 0x00000080
+NIIF_NONE = 0x00000000
+NIIF_INFO = 0x00000001
+NIIF_WARNING = 0x00000002
+NIIF_ERROR = 0x00000003
+NIIF_NOSOUND = 0x00000010
+NOTIFYICON_VERSION_4 = 4
 
 # --- Win32 API ---
 user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
+shell32 = ctypes.windll.shell32
 
 # Pointer-sized types for 64-bit correctness
 LRESULT = wt.LPARAM  # LRESULT is pointer-sized (8 bytes on x64)
@@ -105,6 +122,31 @@ user32.ToUnicodeEx.restype = ctypes.c_int
 # -- Module --
 kernel32.GetModuleHandleW.argtypes = [wt.LPCWSTR]
 kernel32.GetModuleHandleW.restype = wt.HMODULE
+# -- Notifications (Shell32) --
+user32.LoadIconW.argtypes = [wt.HINSTANCE, wt.LPCWSTR]
+user32.LoadIconW.restype = wt.HICON
+
+class NOTIFYICONDATAW(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wt.DWORD),
+        ("hWnd", wt.HWND),
+        ("uID", wt.UINT),
+        ("uFlags", wt.UINT),
+        ("uCallbackMessage", wt.UINT),
+        ("hIcon", wt.HICON),
+        ("szTip", wt.WCHAR * 128),
+        ("dwState", wt.DWORD),
+        ("dwStateMask", wt.DWORD),
+        ("szInfo", wt.WCHAR * 256),
+        ("uVersion", wt.UINT),
+        ("szInfoTitle", wt.WCHAR * 64),
+        ("dwInfoFlags", wt.DWORD),
+        ("guidItem", ctypes.c_byte * 16),
+        ("hBalloonIcon", wt.HICON),
+    ]
+
+shell32.Shell_NotifyIconW.argtypes = [wt.DWORD, ctypes.POINTER(NOTIFYICONDATAW)]
+shell32.Shell_NotifyIconW.restype = wt.BOOL
 
 # --- Structures ---
 class RAWINPUTDEVICE(ctypes.Structure):
@@ -178,18 +220,79 @@ cf_exclude = 0
 cf_no_history = 0
 cf_no_cloud = 0
 
-# --- Debug ---
+# Notification state
+_notify_icon_added = False
+_NOTIFY_ID = 1001
+
+# --- Debug & Logging ---
 debug_mode = "--debug" in sys.argv
 log_file = None
 
 def log(msg):
+    """Always log to file; print to console only in debug mode."""
+    ts = time.strftime("%H:%M:%S", time.localtime()) + f".{int(time.time()*1000)%1000:03d}"
+    line = f"[{ts}] {msg}"
     if debug_mode:
-        ts = time.strftime("%H:%M:%S", time.localtime()) + f".{int(time.time()*1000)%1000:03d}"
-        line = f"[{ts}] {msg}"
         print(line)
-        if log_file:
+    if log_file:
+        try:
             log_file.write(line + "\n")
             log_file.flush()
+        except (OSError, ValueError):
+            pass
+
+# --- Notifications ---
+def _ensure_notify_icon():
+    """Add the notification tray icon if not already present."""
+    global _notify_icon_added
+    if _notify_icon_added or not hwnd_main:
+        return _notify_icon_added
+
+    nid = NOTIFYICONDATAW()
+    nid.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
+    nid.hWnd = hwnd_main
+    nid.uID = _NOTIFY_ID
+    nid.uFlags = NIF_ICON | NIF_TIP | NIF_SHOWTIP
+    nid.hIcon = user32.LoadIconW(None, ctypes.cast(32512, wt.LPCWSTR))
+    nid.szTip = "SwiftSlate Desktop"
+
+    if shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(nid)):
+        nid.uVersion = NOTIFYICON_VERSION_4
+        shell32.Shell_NotifyIconW(NIM_SETVERSION, ctypes.byref(nid))
+        _notify_icon_added = True
+        return True
+    return False
+
+def notify(title, message, icon=NIIF_INFO):
+    """Show a Windows toast notification. Non-blocking, safe to call from any thread.
+    icon: NIIF_INFO (blue), NIIF_WARNING (yellow), NIIF_ERROR (red)
+    """
+    if not hwnd_main:
+        return
+    try:
+        _ensure_notify_icon()
+        nid = NOTIFYICONDATAW()
+        nid.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
+        nid.hWnd = hwnd_main
+        nid.uID = _NOTIFY_ID
+        nid.uFlags = NIF_INFO
+        nid.szInfoTitle = title[:63]
+        nid.szInfo = message[:255]
+        nid.dwInfoFlags = icon | NIIF_NOSOUND
+        shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(nid))
+    except Exception as e:
+        log(f"Notification failed: {e}")
+
+def _remove_notify_icon():
+    """Remove tray icon on exit."""
+    global _notify_icon_added
+    if _notify_icon_added and hwnd_main:
+        nid = NOTIFYICONDATAW()
+        nid.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
+        nid.hWnd = hwnd_main
+        nid.uID = _NOTIFY_ID
+        shell32.Shell_NotifyIconW(NIM_DELETE, ctypes.byref(nid))
+        _notify_icon_added = False
 
 # --- Load config ---
 def load_config():
@@ -212,6 +315,7 @@ def load_config():
     # Validate config
     if not api_keys or not any(k.strip() for k in api_keys):
         log("ERROR: No valid API keys in config.json")
+        notify("SwiftSlate", "No valid API keys in config.json.", NIIF_ERROR)
         if debug_mode:
             print("  Error: No API keys configured. Edit config.json.")
         return False
@@ -301,12 +405,14 @@ def _start_file_watcher():
                         _config_mtime = ct
                         _commands_mtime = cm
                         log("Hot reload: config/commands reloaded")
+                        notify("SwiftSlate", "Config reloaded.", NIIF_INFO)
                     else:
                         # Restore previous working state
                         commands.update(old_commands)
                         trigger_strings.update(old_triggers)
                         trigger_last_chars.update(old_last_chars)
                         log("Hot reload: config invalid, restored previous state")
+                        notify("SwiftSlate", "Config invalid — using previous settings.", NIIF_WARNING)
                 elif changed and processing:
                     # Don't update mtimes — retry on next tick
                     log("Hot reload: deferred (processing)")
@@ -388,14 +494,21 @@ def _check_network():
 
 def call_api(text, prompt):
     """Call API with key rotation and retry on transient errors.
-    On network/timeout failures, checks connectivity first before retrying."""
+    On network/timeout failures, checks connectivity first before retrying.
+    Returns (result_text, error_reason) — one will be None."""
     system_content = SYSTEM_PROMPT_PREFIX + prompt
     max_attempts = max(len(api_keys), 1)
     last_error = None
+    failure_reason = None
 
     for attempt in range(max_attempts):
         key = get_next_key()
         if not key:
+            # All keys exhausted
+            if _invalid_keys and len(_invalid_keys) >= len(api_keys):
+                failure_reason = "All API keys rejected (401/403). Check your config."
+            else:
+                failure_reason = "All API keys rate-limited. Wait and retry."
             break
 
         try:
@@ -406,7 +519,7 @@ def call_api(text, prompt):
                 result = _call_openai_compatible(text, system_content, key, endpoint)
 
             if result is not None:
-                return result
+                return result, None
 
         except urllib.error.HTTPError as e:
             err_type = classify_error(e, e.code)
@@ -430,9 +543,11 @@ def call_api(text, prompt):
                 continue  # Try next key
 
             elif err_type == ERR_SERVER:
+                failure_reason = f"Server error (HTTP {e.code}). Provider may be down."
                 continue  # 5xx — try next key
 
             else:
+                failure_reason = f"API error (HTTP {e.code})."
                 break  # Non-retryable (400, etc.)
 
         except (urllib.error.URLError, TimeoutError, OSError) as e:
@@ -445,20 +560,31 @@ def call_api(text, prompt):
                 log("Network error — checking connectivity...")
                 if not _check_network():
                     log("No internet — aborting retries")
+                    failure_reason = "No internet connection."
                     break
                 # Network is fine — problem is provider-side, try next key
                 log("Network OK — retrying with next key")
+                failure_reason = f"Provider unreachable ({type(e).__name__})."
                 continue
             else:
+                failure_reason = f"Network error: {type(e).__name__}."
                 break
 
         except Exception as e:
             last_error = e
             log(f"Attempt {attempt+1}/{max_attempts}: unexpected - {e}")
+            failure_reason = f"Unexpected error: {type(e).__name__}."
             break
 
-    log(f"All attempts failed: {last_error}")
-    return None
+    # Determine final failure reason if not already set
+    if not failure_reason:
+        if last_error:
+            failure_reason = f"All {max_attempts} attempts failed: {type(last_error).__name__}."
+        else:
+            failure_reason = "No API keys available."
+
+    log(f"API call failed: {failure_reason}")
+    return None, failure_reason
 
 def _call_gemini(text, system_content, key):
     """Call Google Gemini API (generateContent endpoint). Raises on HTTP errors."""
@@ -754,11 +880,12 @@ def do_transform(trigger_name, prompt):
 
         # Async API call
         result_holder = [None]
+        error_holder = [None]
         done_event = threading.Event()
 
         def api_thread():
             try:
-                result_holder[0] = call_api(input_text, prompt)
+                result_holder[0], error_holder[0] = call_api(input_text, prompt)
             finally:
                 done_event.set()
 
@@ -809,11 +936,13 @@ def do_transform(trigger_name, prompt):
 
         # Paste result
         result = result_holder[0]
+        error_reason = error_holder[0]
         log(f"Result: {len(result) if result else 0} chars")
 
         if timed_out:
             # API took too long or paste kept failing — restore the original text
             log("Timed out — restoring original text")
+            notify("SwiftSlate", "Transform timed out. Try again.", NIIF_WARNING)
             if user32.GetForegroundWindow() == hwnd:
                 _retry_paste(input_text)
             prev_clip = None
@@ -838,10 +967,13 @@ def do_transform(trigger_name, prompt):
                 # API failed — restore original text (remove spinner)
                 log("API returned nothing — restoring original text")
                 _retry_paste(input_text)
+                notify("SwiftSlate", error_reason or "Transform failed.", NIIF_ERROR)
         else:
             # Window not focused - put result on clipboard for manual paste
             set_clipboard_silent(result if result else input_text)
             log("Result on clipboard (window not focused)")
+            if not result:
+                notify("SwiftSlate", error_reason or "Transform failed.", NIIF_ERROR)
             # Don't restore prev_clip — leave result available
             prev_clip = None
     finally:
@@ -1139,16 +1271,19 @@ def acquire_singleton():
 def main():
     global hwnd_main, cf_exclude, cf_no_history, cf_no_cloud, log_file
 
-    if debug_mode:
-        log_path = os.path.join(script_dir, "debug.log")
-        log_file = open(log_path, "w", encoding="utf-8")
-        log(f"Script directory: {script_dir}")
+    # Always write to debug.log for diagnostics; --debug also prints to console
+    log_path = os.path.join(script_dir, "debug.log")
+    log_file = open(log_path, "w", encoding="utf-8")
+    log(f"Script directory: {script_dir}")
+    log(f"Debug mode: {debug_mode}")
 
     # Prevent duplicate instances
     if not acquire_singleton():
         log("Another instance is already running. Exiting.")
         if debug_mode:
             print("  Another SwiftSlate instance is already running.")
+        # Can't use notify() here — no hwnd_main yet, and the other instance owns the tray icon
+        ctypes.windll.user32.MessageBoxW(None, "Another SwiftSlate instance is already running.", "SwiftSlate", 0x30)
         return
 
     if not load_config():
@@ -1203,6 +1338,9 @@ def main():
     log("Raw Input registered")
     log(f"SwiftSlate Desktop running ({provider}, {model})")
 
+    # Notify user that SwiftSlate is running
+    notify("SwiftSlate", f"Running ({provider}, {model})", NIIF_INFO)
+
     if debug_mode:
         print("  SwiftSlate Desktop running")
         print("  Type a trigger anywhere to transform text.")
@@ -1215,6 +1353,7 @@ def main():
         user32.DispatchMessageW(ctypes.byref(msg))
 
     # Cleanup
+    _remove_notify_icon()
     log("Shutting down")
     if log_file:
         log_file.close()
