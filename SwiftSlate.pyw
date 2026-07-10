@@ -253,6 +253,7 @@ def _ensure_notify_icon():
     nid.hWnd = hwnd_main
     nid.uID = _NOTIFY_ID
     nid.uFlags = NIF_ICON | NIF_TIP | NIF_SHOWTIP
+    # Use default app icon (Python's icon shows in header, which is fine)
     nid.hIcon = user32.LoadIconW(None, ctypes.cast(32512, wt.LPCWSTR))
     nid.szTip = "SwiftSlate Desktop"
 
@@ -742,7 +743,10 @@ class INPUT(ctypes.Structure):
 
 INPUT_KEYBOARD = 1
 KEYEVENTF_KEYUP = 0x0002
+KEYEVENTF_UNICODE = 0x0004
 VK_CONTROL = 0x11
+VK_SHIFT = 0x10
+VK_LEFT = 0x25
 _KEY_MAP = {"a": 0x41, "c": 0x43, "v": 0x56}
 
 # Magic value to tag self-generated keystrokes (so Raw Input hook ignores them)
@@ -774,6 +778,39 @@ def send_keys(keys):
             if sent != 4:
                 log(f"SendInput: only {sent}/4 events injected (UIPI or blocked)")
             time.sleep(0.01)
+
+def _replace_last_char(ch):
+    """Replace the last character in the focused field using Shift+Left + Unicode input.
+    No clipboard needed, no selection flash. All events sent atomically."""
+    code = ord(ch)
+    inp = INPUT()
+    inp.type = INPUT_KEYBOARD
+
+    inputs = (INPUT * 6)(
+        _make_key(VK_SHIFT),                            # Shift down
+        _make_key(VK_LEFT),                             # Left down (selects 1 char back)
+        _make_key(VK_LEFT, KEYEVENTF_KEYUP),            # Left up
+        _make_key(VK_SHIFT, KEYEVENTF_KEYUP),           # Shift up
+    )
+    # Unicode char down (replaces selection)
+    inputs[4].type = INPUT_KEYBOARD
+    inputs[4].union.ki.wVk = 0
+    inputs[4].union.ki.wScan = code
+    inputs[4].union.ki.dwFlags = KEYEVENTF_UNICODE
+    inputs[4].union.ki.time = 0
+    inputs[4].union.ki.dwExtraInfo = _SELF_INPUT_TAG
+    # Unicode char up
+    inputs[5].type = INPUT_KEYBOARD
+    inputs[5].union.ki.wVk = 0
+    inputs[5].union.ki.wScan = code
+    inputs[5].union.ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP
+    inputs[5].union.ki.time = 0
+    inputs[5].union.ki.dwExtraInfo = _SELF_INPUT_TAG
+
+    sent = user32.SendInput(6, ctypes.byref(inputs), ctypes.sizeof(INPUT))
+    if sent != 6:
+        log(f"SendInput (_replace_last_char): only {sent}/6 events injected")
+    return sent == 6
 
 # --- Grab text from active field ---
 def grab_field_text():
@@ -921,16 +958,24 @@ def do_transform(trigger_name, prompt):
                 done_event.wait(timeout=MAX_SPINNER_SECONDS)
                 break
             spinner = spinner_frames[frame % 4]
-            if paste_text(input_text + " " + spinner):
-                consecutive_paste_failures = 0
+            if frame == 0:
+                # First frame: full paste to establish text + spinner
+                if paste_text(input_text + " " + spinner):
+                    consecutive_paste_failures = 0
+                else:
+                    consecutive_paste_failures += 1
+                    log(f"Spinner paste failed ({consecutive_paste_failures})")
             else:
-                consecutive_paste_failures += 1
-                log(f"Spinner paste failed ({consecutive_paste_failures})")
-                # If clipboard is locked for too long, bail out
-                if consecutive_paste_failures >= 10:
-                    log("Too many paste failures — aborting spinner")
-                    timed_out = True
-                    break
+                # Subsequent frames: only replace the last character (no clipboard, no flash)
+                if not _replace_last_char(spinner):
+                    consecutive_paste_failures += 1
+                    log(f"Spinner replace failed ({consecutive_paste_failures})")
+                else:
+                    consecutive_paste_failures = 0
+            if consecutive_paste_failures >= 10:
+                log("Too many paste failures — aborting spinner")
+                timed_out = True
+                break
             frame += 1
             done_event.wait(timeout=0.2)
 
