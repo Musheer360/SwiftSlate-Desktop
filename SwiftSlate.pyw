@@ -935,7 +935,8 @@ def grab_field_text():
 
 # --- Paste text into active field ---
 def paste_text(text):
-    """Select all and paste text into the active field. Returns True on success."""
+    """Select all and paste text into the active field. Returns True on success.
+    Uses proven timing: 100ms pre-paste delay, 10ms between key events."""
     fg = user32.GetForegroundWindow()
     if not fg:
         return False
@@ -948,36 +949,20 @@ def paste_text(text):
     try:
         if not set_clipboard_silent(text):
             return False
-        # Step 1: Select All (atomic within itself)
-        inputs_select = (INPUT * 4)(
-            _make_key(VK_CONTROL),
-            _make_key(0x41),
-            _make_key(0x41, KEYEVENTF_KEYUP),
-            _make_key(VK_CONTROL, KEYEVENTF_KEYUP),
-        )
-        sent = user32.SendInput(4, ctypes.byref(inputs_select), ctypes.sizeof(INPUT))
-        if sent != 4:
-            log(f"SendInput (Ctrl+A): only {sent}/4")
-            return False
-        # Let target app process the selection — Chrome/Electron need this
-        time.sleep(0.03)
-        # Step 2: Paste (atomic within itself)
-        inputs_paste = (INPUT * 4)(
-            _make_key(VK_CONTROL),
-            _make_key(0x56),
-            _make_key(0x56, KEYEVENTF_KEYUP),
-            _make_key(VK_CONTROL, KEYEVENTF_KEYUP),
-        )
-        sent = user32.SendInput(4, ctypes.byref(inputs_paste), ctypes.sizeof(INPUT))
-        if sent != 4:
-            log(f"SendInput (Ctrl+V): only {sent}/4")
-            return False
+        # Pre-paste delay: let clipboard fully commit before sending keys
+        time.sleep(0.10)
+        # Select All: Ctrl down, A down, A up, Ctrl up (with 10ms between each event)
+        # Select all with delay for target app to process selection
+        send_keys("^a")
+        # Let target app process selection (100ms — proven safe for React/Electron/Discord)
+        time.sleep(0.10)
+        # Paste: Ctrl+V
+        send_keys("^v")
         time.sleep(0.02)
         return True
     finally:
         if attached:
             user32.AttachThreadInput(our_tid, fg_tid, False)
-
 # --- Retry paste (ensures text gets into the field even if clipboard is contested) ---
 def _retry_paste(text, max_retries=5):
     """Attempt to paste text, retrying if clipboard is locked."""
@@ -1032,8 +1017,11 @@ def do_transform(trigger_name, prompt):
 
         threading.Thread(target=api_thread, daemon=True).start()
 
-        # Spinner animation (200ms per frame)
-        # Hard cap: 45 seconds total — if API hasn't responded, give up
+        # --- Spinner (Approach C: Hybrid) ---
+        # Frame 0: paste into existing selection (no Ctrl+A — field still selected from grab)
+        # Frames 1+: _replace_last_char only (clipboard-free, atomic)
+        # If frame 0 fails: wait silently (zero field modification)
+        # If _replace_last_char fails: freeze spinner (no corruption)
         MAX_SPINNER_SECONDS = 45
         frame = 0
         window_changed = False
@@ -1041,51 +1029,75 @@ def do_transform(trigger_name, prompt):
         timed_out = False
         abort_event.clear()
         spinner_start = time.time()
-        consecutive_paste_failures = 0
+        spinner_active = False  # True once frame 0 paste succeeds
+
+        # Frame 0: paste text+spinner into the EXISTING selection from grab_field_text
+        # Key insight: grab_field_text did Ctrl+A+Ctrl+C, so text is still selected.
+        # We only need Ctrl+V (no Ctrl+A) — eliminates the Chromium Ctrl+A race.
+        if user32.GetForegroundWindow() == hwnd:
+            spinner_text = input_text + " " + spinner_frames[0]
+            seq_before = user32.GetClipboardSequenceNumber()
+            if set_clipboard_silent(spinner_text):
+                seq_after = user32.GetClipboardSequenceNumber()
+                # Verify clipboard is still ours (not stolen by another app)
+                time.sleep(0.01)
+                if user32.GetClipboardSequenceNumber() == seq_after:
+                    # Paste only (Ctrl+V) — text is already selected
+                    inputs_paste = (INPUT * 4)(
+                        _make_key(VK_CONTROL),
+                        _make_key(0x56),
+                        _make_key(0x56, KEYEVENTF_KEYUP),
+                        _make_key(VK_CONTROL, KEYEVENTF_KEYUP),
+                    )
+                    sent = user32.SendInput(4, ctypes.byref(inputs_paste), ctypes.sizeof(INPUT))
+                    if sent == 4:
+                        spinner_active = True
+                        frame = 1
+                        time.sleep(0.02)
+                        log("Spinner started (paste into selection)")
+                    else:
+                        log(f"Spinner frame 0: SendInput failed ({sent}/4)")
+                else:
+                    log("Spinner frame 0: clipboard stolen — silent mode")
+            else:
+                log("Spinner frame 0: set_clipboard failed — silent mode")
+
+        if not spinner_active:
+            log("Spinner: silent mode (frame 0 failed or skipped)")
 
         while not done_event.is_set():
-            # Hard timeout — don't spin forever
+            # Hard timeout
             if (time.time() - spinner_start) > MAX_SPINNER_SECONDS:
                 log("Spinner timed out — API took too long")
                 timed_out = True
                 break
-            # User typed during processing — abort spinner, preserve their input
+            # User typed during processing
             if abort_event.is_set():
                 log("Spinner aborted — user is typing")
                 aborted = True
                 break
+            # Window changed
             if user32.GetForegroundWindow() != hwnd:
                 log("Window changed, waiting silently")
                 window_changed = True
-                # Restore original text in field before leaving (remove spinner char)
-                paste_text(input_text)
+                if spinner_active:
+                    paste_text(input_text)
                 done_event.wait(timeout=MAX_SPINNER_SECONDS)
                 break
-            spinner = spinner_frames[frame % 4]
-            if frame == 0:
-                # First frame: full paste to establish text + spinner
-                if paste_text(input_text + " " + spinner):
-                    consecutive_paste_failures = 0
-                else:
-                    consecutive_paste_failures += 1
-                    log(f"Spinner paste failed ({consecutive_paste_failures})")
-            else:
-                # Check abort right before replacing to minimize race window
+
+            # Animate only if spinner is active
+            if spinner_active:
                 if abort_event.is_set():
-                    log("Spinner aborted — user is typing")
                     aborted = True
                     break
-                # Subsequent frames: only replace the last character (no clipboard, no flash)
+                spinner = spinner_frames[frame % 4]
                 if not _replace_last_char(spinner):
-                    consecutive_paste_failures += 1
-                    log(f"Spinner replace failed ({consecutive_paste_failures})")
-                else:
-                    consecutive_paste_failures = 0
-            if consecutive_paste_failures >= 3:
-                log("Too many spinner failures — aborting")
-                timed_out = True
-                break
-            frame += 1
+                    # Failed — freeze animation, wait silently (never fall back to paste_text)
+                    log("Spinner frozen: _replace_last_char failed")
+                    done_event.wait(timeout=MAX_SPINNER_SECONDS - (time.time() - spinner_start))
+                    break
+                frame += 1
+
             done_event.wait(timeout=0.2)
 
         # Paste result
@@ -1097,12 +1109,12 @@ def do_transform(trigger_name, prompt):
             # API took too long or paste kept failing — restore the original text
             log("Timed out — restoring original text")
             _notify_debounced("Transform timed out. Try again.", NIIF_WARNING)
-            if user32.GetForegroundWindow() == hwnd:
+            if spinner_active and user32.GetForegroundWindow() == hwnd:
                 _retry_paste(input_text)
             prev_clip = None
         elif aborted:
             # User started typing — restore original text (remove spinner char)
-            if user32.GetForegroundWindow() == hwnd:
+            if spinner_active and user32.GetForegroundWindow() == hwnd:
                 paste_text(input_text)
             # Wait for API result silently, put on clipboard so user can paste
             done_event.wait(timeout=30)
