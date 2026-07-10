@@ -114,6 +114,8 @@ user32.RegisterRawInputDevices.restype = wt.BOOL
 # -- Keyboard --
 user32.GetKeyboardState.argtypes = [ctypes.POINTER(ctypes.c_ubyte)]
 user32.GetKeyboardState.restype = wt.BOOL
+user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+user32.GetAsyncKeyState.restype = wt.SHORT
 user32.GetKeyboardLayout.argtypes = [wt.DWORD]
 user32.GetKeyboardLayout.restype = wt.HKL
 user32.ToUnicodeEx.argtypes = [wt.UINT, wt.UINT, ctypes.POINTER(ctypes.c_ubyte),
@@ -295,6 +297,28 @@ def _remove_notify_icon():
         shell32.Shell_NotifyIconW(NIM_DELETE, ctypes.byref(nid))
         _notify_icon_added = False
 
+# Debounce: suppress duplicate notifications within 10 seconds
+_last_notify_msg = ""
+_last_notify_time = 0.0
+_last_error_notify_time = 0.0  # Global throttle for error notifications
+
+def _notify_debounced(message, icon=NIIF_INFO):
+    """Send notification with deduplication — suppresses identical messages within 10s.
+    Error notifications are additionally throttled to max 1 per 30s globally."""
+    global _last_notify_msg, _last_notify_time, _last_error_notify_time
+    now = time.time()
+    # Suppress identical messages within 10s
+    if message == _last_notify_msg and (now - _last_notify_time) < 10:
+        return
+    # Global throttle for error/warning notifications (max 1 per 30s)
+    if icon in (NIIF_ERROR, NIIF_WARNING) and (now - _last_error_notify_time) < 30:
+        return
+    _last_notify_msg = message
+    _last_notify_time = now
+    if icon in (NIIF_ERROR, NIIF_WARNING):
+        _last_error_notify_time = now
+    notify("SwiftSlate", message, icon)
+
 # --- Load config ---
 def load_config():
     global config, commands, api_keys, model, prefix, translate_prefix
@@ -302,8 +326,25 @@ def load_config():
     global provider, temperature, custom_endpoint
 
     config_path = os.path.join(script_dir, "config.json")
-    with open(config_path, "r", encoding="utf-8-sig") as f:
-        config = json.load(f)
+
+    # Check config file exists
+    if not os.path.exists(config_path):
+        log("ERROR: config.json not found")
+        notify("SwiftSlate", "config.json not found. Create it in .swiftslate folder.", NIIF_ERROR)
+        return False
+
+    # Parse config JSON
+    try:
+        with open(config_path, "r", encoding="utf-8-sig") as f:
+            config = json.load(f)
+    except (json.JSONDecodeError, ValueError) as e:
+        log(f"ERROR: config.json is malformed: {e}")
+        notify("SwiftSlate", f"config.json parse error: {e}", NIIF_ERROR)
+        return False
+    except (OSError, IOError) as e:
+        log(f"ERROR: Cannot read config.json: {e}")
+        notify("SwiftSlate", "Cannot read config.json.", NIIF_ERROR)
+        return False
 
     api_keys = config.get("api_keys", [])
     model = config.get("model", "llama-3.3-70b-versatile")
@@ -313,8 +354,19 @@ def load_config():
     custom_endpoint = config.get("endpoint", "")
     translate_prefix = prefix + "translate:"
 
-    # Validate config
-    if not api_keys or not any(k.strip() for k in api_keys):
+    # Validate prefix
+    if not isinstance(prefix, str) or not prefix:
+        log("WARNING: Invalid prefix, defaulting to '?'")
+        prefix = "?"
+        translate_prefix = prefix + "translate:"
+
+    # Validate temperature
+    if not isinstance(temperature, (int, float)):
+        temperature = 0.5
+    temperature = max(0.0, min(2.0, float(temperature)))
+
+    # Validate API keys
+    if not api_keys or not any(k.strip() for k in api_keys if isinstance(k, str)):
         log("ERROR: No valid API keys in config.json")
         notify("SwiftSlate", "No valid API keys in config.json.", NIIF_ERROR)
         if debug_mode:
@@ -322,7 +374,7 @@ def load_config():
         return False
 
     # Filter out empty keys
-    api_keys = [k for k in api_keys if k.strip()]
+    api_keys = [k for k in api_keys if isinstance(k, str) and k.strip()]
 
     if provider not in ("groq", "gemini", "custom"):
         log(f"WARNING: Unknown provider '{provider}', defaulting to groq")
@@ -330,20 +382,39 @@ def load_config():
 
     if provider == "custom" and not custom_endpoint:
         log("WARNING: Custom provider but no endpoint set, defaulting to groq")
+        notify("SwiftSlate", "Custom provider set but no endpoint configured.", NIIF_WARNING)
+        provider = "groq"
+
+    if provider == "custom" and custom_endpoint and not custom_endpoint.startswith(("http://", "https://")):
+        log(f"WARNING: Custom endpoint must start with http:// or https://")
+        notify("SwiftSlate", "Custom endpoint URL is invalid.", NIIF_ERROR)
         provider = "groq"
 
     # Load commands
     commands_path = os.path.join(script_dir, "commands.json")
     if os.path.exists(commands_path):
-        with open(commands_path, "r", encoding="utf-8-sig") as f:
-            cmd_list = json.load(f)
-        for cmd in cmd_list:
-            cmd_type = cmd.get("type", "ai")
-            commands[cmd["trigger"]] = {
-                "type": cmd_type,
-                "prompt": cmd.get("prompt", ""),
-                "value": cmd.get("value", ""),
-            }
+        try:
+            with open(commands_path, "r", encoding="utf-8-sig") as f:
+                cmd_list = json.load(f)
+            for cmd in cmd_list:
+                if not isinstance(cmd, dict) or "trigger" not in cmd:
+                    continue  # Skip malformed entries
+                trigger = cmd["trigger"]
+                if not isinstance(trigger, str) or not trigger.strip():
+                    continue
+                if trigger in commands:
+                    log(f"WARNING: Duplicate trigger '{trigger}' in commands.json (overwritten)")
+                cmd_type = cmd.get("type", "ai")
+                commands[trigger] = {
+                    "type": cmd_type,
+                    "prompt": cmd.get("prompt", ""),
+                    "value": cmd.get("value", ""),
+                }
+        except (json.JSONDecodeError, ValueError) as e:
+            log(f"WARNING: commands.json parse error: {e}")
+            notify("SwiftSlate", f"commands.json parse error: {e}", NIIF_WARNING)
+        except (OSError, IOError) as e:
+            log(f"WARNING: Cannot read commands.json: {e}")
 
     # System commands
     for s in ("undo", "copy", "cut", "paste", "replace"):
@@ -376,9 +447,9 @@ def _start_file_watcher():
 
     # Store initial mtimes
     try: _config_mtime = os.path.getmtime(config_path)
-    except: pass
+    except OSError: pass
     try: _commands_mtime = os.path.getmtime(commands_path)
-    except: pass
+    except OSError: pass
 
     def watcher():
         global _config_mtime, _commands_mtime
@@ -393,32 +464,38 @@ def _start_file_watcher():
                     changed = True
 
                 if changed and not processing:
-                    # Reload into temp state, then swap atomically
+                    # Save old state as backup
                     old_commands = dict(commands)
                     old_triggers = dict(trigger_strings)
                     old_last_chars = set(trigger_last_chars)
+                    old_keys = list(api_keys)
+
+                    # Rebuild into globals (load_config populates them)
                     commands.clear()
                     trigger_strings.clear()
                     trigger_last_chars.clear()
-                    _rate_limited_keys.clear()
-                    _invalid_keys.clear()
+
                     if load_config():
                         _config_mtime = ct
                         _commands_mtime = cm
+                        # Only reset key tracking if the actual keys changed
+                        if set(api_keys) != set(old_keys):
+                            _rate_limited_keys.clear()
+                            _invalid_keys.clear()
                         log("Hot reload: config/commands reloaded")
-                        notify("SwiftSlate", "Config reloaded.", NIIF_INFO)
+                        _notify_debounced("Config reloaded.", NIIF_INFO)
                     else:
                         # Restore previous working state
                         commands.update(old_commands)
                         trigger_strings.update(old_triggers)
                         trigger_last_chars.update(old_last_chars)
                         log("Hot reload: config invalid, restored previous state")
-                        notify("SwiftSlate", "Config invalid — using previous settings.", NIIF_WARNING)
+                        _notify_debounced("Config error \u2014 using previous settings.", NIIF_WARNING)
                 elif changed and processing:
                     # Don't update mtimes — retry on next tick
                     log("Hot reload: deferred (processing)")
-            except:
-                pass
+            except Exception as e:
+                log(f"Hot reload error: {e}")
 
     threading.Thread(target=watcher, daemon=True).start()
 
@@ -534,7 +611,7 @@ def call_api(text, prompt):
                     ra = e.headers.get("Retry-After")
                     if ra and ra.isdigit():
                         retry_after = int(ra)
-                except:
+                except Exception:
                     pass
                 report_rate_limit(key, retry_after)
                 continue  # Try next key
@@ -590,7 +667,7 @@ def call_api(text, prompt):
 def _call_gemini(text, system_content, key):
     """Call Google Gemini API (generateContent endpoint). Raises on HTTP errors."""
     safe_model = model.replace("/", "%2F")
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{safe_model}:generateContent?key={key}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{safe_model}:generateContent"
 
     body = json.dumps({
         "systemInstruction": {
@@ -606,6 +683,7 @@ def _call_gemini(text, system_content, key):
 
     req = urllib.request.Request(url, data=body, headers={
         "Content-Type": "application/json",
+        "x-goog-api-key": key,
         "User-Agent": "SwiftSlate/1.0",
     }, method="POST")
 
@@ -819,10 +897,12 @@ def grab_field_text():
 
     # Attach our thread to the foreground window's input queue
     fg = user32.GetForegroundWindow()
+    if not fg:
+        return None, prev
     fg_tid = user32.GetWindowThreadProcessId(fg, None)
     our_tid = kernel32.GetCurrentThreadId()
     attached = False
-    if fg_tid != our_tid:
+    if fg_tid and fg_tid != our_tid:
         attached = user32.AttachThreadInput(our_tid, fg_tid, True)
 
     try:
@@ -835,7 +915,7 @@ def grab_field_text():
         seq_after_clear = user32.GetClipboardSequenceNumber()
 
         send_keys("^a")
-        time.sleep(0.02)
+        time.sleep(0.12)
         send_keys("^c")
 
         # Wait for clipboard sequence number to change from post-clear value
@@ -862,16 +942,37 @@ def paste_text(text):
     fg_tid = user32.GetWindowThreadProcessId(fg, None)
     our_tid = kernel32.GetCurrentThreadId()
     attached = False
-    if fg_tid != our_tid:
+    if fg_tid and fg_tid != our_tid:
         attached = user32.AttachThreadInput(our_tid, fg_tid, True)
 
     try:
         if not set_clipboard_silent(text):
             return False
+        # Step 1: Select All (atomic within itself)
+        inputs_select = (INPUT * 4)(
+            _make_key(VK_CONTROL),
+            _make_key(0x41),
+            _make_key(0x41, KEYEVENTF_KEYUP),
+            _make_key(VK_CONTROL, KEYEVENTF_KEYUP),
+        )
+        sent = user32.SendInput(4, ctypes.byref(inputs_select), ctypes.sizeof(INPUT))
+        if sent != 4:
+            log(f"SendInput (Ctrl+A): only {sent}/4")
+            return False
+        # Let target app process the selection — Chrome/Electron need this
+        time.sleep(0.03)
+        # Step 2: Paste (atomic within itself)
+        inputs_paste = (INPUT * 4)(
+            _make_key(VK_CONTROL),
+            _make_key(0x56),
+            _make_key(0x56, KEYEVENTF_KEYUP),
+            _make_key(VK_CONTROL, KEYEVENTF_KEYUP),
+        )
+        sent = user32.SendInput(4, ctypes.byref(inputs_paste), ctypes.sizeof(INPUT))
+        if sent != 4:
+            log(f"SendInput (Ctrl+V): only {sent}/4")
+            return False
         time.sleep(0.02)
-        send_keys("^a")
-        time.sleep(0.02)
-        send_keys("^v")
         return True
     finally:
         if attached:
@@ -914,6 +1015,9 @@ def do_transform(trigger_name, prompt):
 
         last_original_text = input_text
         log(f"Input: {len(input_text)} chars")
+
+        # Settle delay — let target app fully release clipboard after our Ctrl+C grab
+        time.sleep(0.10)
 
         # Async API call
         result_holder = [None]
@@ -966,14 +1070,19 @@ def do_transform(trigger_name, prompt):
                     consecutive_paste_failures += 1
                     log(f"Spinner paste failed ({consecutive_paste_failures})")
             else:
+                # Check abort right before replacing to minimize race window
+                if abort_event.is_set():
+                    log("Spinner aborted — user is typing")
+                    aborted = True
+                    break
                 # Subsequent frames: only replace the last character (no clipboard, no flash)
                 if not _replace_last_char(spinner):
                     consecutive_paste_failures += 1
                     log(f"Spinner replace failed ({consecutive_paste_failures})")
                 else:
                     consecutive_paste_failures = 0
-            if consecutive_paste_failures >= 10:
-                log("Too many paste failures — aborting spinner")
+            if consecutive_paste_failures >= 3:
+                log("Too many spinner failures — aborting")
                 timed_out = True
                 break
             frame += 1
@@ -987,13 +1096,15 @@ def do_transform(trigger_name, prompt):
         if timed_out:
             # API took too long or paste kept failing — restore the original text
             log("Timed out — restoring original text")
-            notify("SwiftSlate", "Transform timed out. Try again.", NIIF_WARNING)
+            _notify_debounced("Transform timed out. Try again.", NIIF_WARNING)
             if user32.GetForegroundWindow() == hwnd:
                 _retry_paste(input_text)
             prev_clip = None
         elif aborted:
-            # User started typing — don't overwrite. Wait for API result silently
-            # and put it on clipboard so they can paste when ready
+            # User started typing — restore original text (remove spinner char)
+            if user32.GetForegroundWindow() == hwnd:
+                paste_text(input_text)
+            # Wait for API result silently, put on clipboard so user can paste
             done_event.wait(timeout=30)
             result = result_holder[0]
             if result:
@@ -1007,18 +1118,23 @@ def do_transform(trigger_name, prompt):
             # Small delay to ensure last spinner paste settled
             time.sleep(0.05)
             if result:
-                _retry_paste(result)
+                if not _retry_paste(result):
+                    # Paste failed — put result on clipboard so user can paste manually
+                    set_clipboard_silent(result)
+                    log("Paste failed — result placed on clipboard")
+                    _notify_debounced("Paste failed. Result copied to clipboard.", NIIF_WARNING)
+                    prev_clip = None
             else:
                 # API failed — restore original text (remove spinner)
                 log("API returned nothing — restoring original text")
                 _retry_paste(input_text)
-                notify("SwiftSlate", error_reason or "Transform failed.", NIIF_ERROR)
+                _notify_debounced(error_reason or "Transform failed.", NIIF_ERROR)
         else:
             # Window not focused - put result on clipboard for manual paste
             set_clipboard_silent(result if result else input_text)
             log("Result on clipboard (window not focused)")
             if not result:
-                notify("SwiftSlate", error_reason or "Transform failed.", NIIF_ERROR)
+                _notify_debounced(error_reason or "Transform failed.", NIIF_ERROR)
             # Don't restore prev_clip — leave result available
             prev_clip = None
     finally:
@@ -1145,26 +1261,39 @@ def handle_trigger(trigger_name):
     processing = True
     log(f"Trigger: ?{trigger_name}")
 
-    if trigger_name == "undo":
-        threading.Thread(target=do_undo, daemon=True).start()
-    elif trigger_name in ("copy", "cut", "paste", "replace"):
-        threading.Thread(target=lambda: do_clipboard_command(trigger_name), daemon=True).start()
-    elif trigger_name.startswith("translate:"):
-        lang = trigger_name[10:]
-        prompt = f"Translate this text to {lang}. Return only the translated text."
-        threading.Thread(target=lambda: do_transform(trigger_name, prompt), daemon=True).start()
-    elif trigger_name in commands:
-        cmd = commands[trigger_name]
-        if cmd["type"] in ("replacer-text", "replacer-shell"):
-            threading.Thread(target=lambda: do_replacer(trigger_name, cmd["type"], cmd["value"]), daemon=True).start()
+    try:
+        if trigger_name == "undo":
+            threading.Thread(target=do_undo, daemon=True).start()
+        elif trigger_name in ("copy", "cut", "paste", "replace"):
+            threading.Thread(target=lambda: do_clipboard_command(trigger_name), daemon=True).start()
+        elif trigger_name.startswith("translate:"):
+            lang = trigger_name[10:]
+            prompt = f"Translate this text to {lang}. Return only the translated text."
+            threading.Thread(target=lambda: do_transform(trigger_name, prompt), daemon=True).start()
+        elif trigger_name in commands:
+            cmd = commands[trigger_name]
+            if cmd["type"] in ("replacer-text", "replacer-shell"):
+                threading.Thread(target=lambda: do_replacer(trigger_name, cmd["type"], cmd["value"]), daemon=True).start()
+            else:
+                threading.Thread(target=lambda: do_transform(trigger_name, cmd["prompt"]), daemon=True).start()
         else:
-            threading.Thread(target=lambda: do_transform(trigger_name, cmd["prompt"]), daemon=True).start()
-    else:
-        log(f"Unknown trigger: {trigger_name}")
+            log(f"Unknown trigger: {trigger_name}")
+            processing = False
+    except Exception as e:
+        log(f"ERROR in handle_trigger: {e}")
         processing = False
 
 # --- Raw Input keystroke processing ---
 def process_keystroke(vkey, scan_code):
+    global keystroke_buffer, last_fg_hwnd, last_keystroke_time
+
+    try:
+        _process_keystroke_inner(vkey, scan_code)
+    except Exception as e:
+        log(f"ERROR in process_keystroke: {e}")
+        keystroke_buffer.clear()
+
+def _process_keystroke_inner(vkey, scan_code):
     global keystroke_buffer, last_fg_hwnd, last_keystroke_time
 
     # Clear buffer on window change (prevents cross-app trigger firing)
@@ -1198,12 +1327,29 @@ def process_keystroke(vkey, scan_code):
 
     # Convert VKey to character
     user32.GetKeyboardState(key_state)
+
+    # Patch modifier states with GetAsyncKeyState — our thread's GetKeyboardState
+    # doesn't reflect the foreground app's real modifier state since we never have focus
+    for mod_vk in (VK_SHIFT, VK_CONTROL, 0x12, 0xA0, 0xA1, 0xA2, 0xA3):
+        # VK_SHIFT, VK_CONTROL, VK_MENU(Alt), LShift, RShift, LCtrl, RCtrl
+        if user32.GetAsyncKeyState(mod_vk) & 0x8000:
+            key_state[mod_vk] = 0x80
+        else:
+            key_state[mod_vk] = 0
+    # Also patch CapsLock toggle state
+    caps_state = user32.GetAsyncKeyState(0x14)  # VK_CAPITAL
+    key_state[0x14] = 0x01 if (caps_state & 0x0001) else 0x00
+
+    # Skip chars while Ctrl is held (our own SendInput or user shortcut)
+    if key_state[VK_CONTROL] & 0x80:
+        return
+
     # Get foreground window's keyboard layout
     fg = user32.GetForegroundWindow()
     tid = user32.GetWindowThreadProcessId(fg, None)
     layout = user32.GetKeyboardLayout(tid)
 
-    ret = user32.ToUnicodeEx(vkey, scan_code, key_state, char_buffer, 4, 0, layout)
+    ret = user32.ToUnicodeEx(vkey, scan_code, key_state, char_buffer, 4, 4, layout)
     if ret < 0:
         # Dead key (diacritic) — ignore safely, don't corrupt buffer
         return
@@ -1274,22 +1420,25 @@ def process_keystroke(vkey, scan_code):
 def wnd_proc(hwnd, msg, wparam, lparam):
     global hwnd_main
 
-    if msg == WM_INPUT:
-        dw_size = wt.UINT(0)
-        user32.GetRawInputData(lparam, RID_INPUT, None, ctypes.byref(dw_size), ctypes.sizeof(RAWINPUTHEADER))
-        if dw_size.value > 0:
-            buf = ctypes.create_string_buffer(dw_size.value)
-            if user32.GetRawInputData(lparam, RID_INPUT, buf, ctypes.byref(dw_size), ctypes.sizeof(RAWINPUTHEADER)) == dw_size.value:
-                raw = ctypes.cast(buf, ctypes.POINTER(RAWINPUT)).contents
-                if raw.header.dwType == RIM_TYPEKEYBOARD:
-                    # Skip self-generated keystrokes (from our own SendInput)
-                    if raw.keyboard.ExtraInformation == _SELF_INPUT_TAG:
-                        pass
-                    elif raw.keyboard.Message == WM_KEYDOWN or raw.keyboard.Message == WM_SYSKEYDOWN:
-                        process_keystroke(raw.keyboard.VKey, raw.keyboard.MakeCode)
+    try:
+        if msg == WM_INPUT:
+            dw_size = wt.UINT(0)
+            user32.GetRawInputData(lparam, RID_INPUT, None, ctypes.byref(dw_size), ctypes.sizeof(RAWINPUTHEADER))
+            if dw_size.value > 0:
+                buf = ctypes.create_string_buffer(dw_size.value)
+                if user32.GetRawInputData(lparam, RID_INPUT, buf, ctypes.byref(dw_size), ctypes.sizeof(RAWINPUTHEADER)) == dw_size.value:
+                    raw = ctypes.cast(buf, ctypes.POINTER(RAWINPUT)).contents
+                    if raw.header.dwType == RIM_TYPEKEYBOARD:
+                        # Skip self-generated keystrokes (from our own SendInput)
+                        if raw.keyboard.ExtraInformation == _SELF_INPUT_TAG:
+                            pass
+                        elif raw.keyboard.Message == WM_KEYDOWN or raw.keyboard.Message == WM_SYSKEYDOWN:
+                            process_keystroke(raw.keyboard.VKey, raw.keyboard.MakeCode)
 
-    elif msg == WM_DESTROY:
-        user32.PostQuitMessage(0)
+        elif msg == WM_DESTROY:
+            user32.PostQuitMessage(0)
+    except Exception as e:
+        log(f"ERROR in wnd_proc: {e}")
 
     return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
 
@@ -1316,11 +1465,11 @@ def acquire_singleton():
 def main():
     global hwnd_main, cf_exclude, cf_no_history, cf_no_cloud, log_file
 
-    # Always write to debug.log for diagnostics; --debug also prints to console
-    log_path = os.path.join(script_dir, "debug.log")
-    log_file = open(log_path, "w", encoding="utf-8")
+    # Only write debug.log when --debug is passed
+    if debug_mode:
+        log_path = os.path.join(script_dir, "debug.log")
+        log_file = open(log_path, "w", encoding="utf-8")
     log(f"Script directory: {script_dir}")
-    log(f"Debug mode: {debug_mode}")
 
     # Prevent duplicate instances
     if not acquire_singleton():
@@ -1382,9 +1531,6 @@ def main():
 
     log("Raw Input registered")
     log(f"SwiftSlate Desktop running ({provider}, {model})")
-
-    # Notify user that SwiftSlate is running
-    notify("SwiftSlate", f"Running ({provider}, {model})", NIIF_INFO)
 
     if debug_mode:
         print("  SwiftSlate Desktop running")
