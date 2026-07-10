@@ -186,7 +186,8 @@ All settings live in `%USERPROFILE%\.swiftslate\` and hot-reload automatically:
   "model": "llama-3.3-70b-versatile",
   "provider": "groq",
   "temperature": 0.3,
-  "prefix": "?"
+  "prefix": "?",
+  "key_delay": 200
 }
 ```
 
@@ -198,6 +199,7 @@ All settings live in `%USERPROFILE%\.swiftslate\` and hot-reload automatically:
 | `temperature` | Response creativity (0.0 = deterministic, 1.0 = creative) |
 | `prefix` | Trigger prefix character (default: `?`) |
 | `endpoint` | Required for `custom` provider (e.g., `http://localhost:11434/v1`) |
+| `key_delay` | Milliseconds between dependent keystrokes (default: `200`). Decrease to `100` on fast machines for snappier response, increase to `300` on very slow machines if text replacement glitches. |
 
 <br>
 

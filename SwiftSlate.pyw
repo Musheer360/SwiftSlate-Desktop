@@ -194,6 +194,7 @@ hwnd_main = None
 provider = "groq"  # groq, gemini, custom
 temperature = 0.5
 custom_endpoint = ""
+key_delay = 0.20  # Seconds between dependent keystroke operations (Ctrl+A → Ctrl+V, etc.)
 
 # Key management (round-robin with rate-limit tracking)
 _key_robin_index = 0
@@ -323,7 +324,7 @@ def _notify_debounced(message, icon=NIIF_INFO):
 def load_config():
     global config, commands, api_keys, model, prefix, translate_prefix
     global trigger_strings, trigger_last_chars
-    global provider, temperature, custom_endpoint
+    global provider, temperature, custom_endpoint, key_delay
 
     config_path = os.path.join(script_dir, "config.json")
 
@@ -364,6 +365,13 @@ def load_config():
     if not isinstance(temperature, (int, float)):
         temperature = 0.5
     temperature = max(0.0, min(2.0, float(temperature)))
+
+    # Validate key_delay (ms between dependent keystrokes — increase on slow machines)
+    key_delay_ms = config.get("key_delay", 200)
+    if not isinstance(key_delay_ms, (int, float)):
+        key_delay_ms = 100
+    key_delay_ms = max(30, min(500, int(key_delay_ms)))  # Clamp 30-500ms
+    key_delay = key_delay_ms / 1000.0  # Convert to seconds for time.sleep()
 
     # Validate API keys
     if not api_keys or not any(k.strip() for k in api_keys if isinstance(k, str)):
@@ -430,7 +438,7 @@ def load_config():
     for c in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ":
         trigger_last_chars.add(c)
 
-    log(f"Config loaded: model={model}, prefix={prefix}, keys={len(api_keys)}")
+    log(f"Config loaded: model={model}, prefix={prefix}, keys={len(api_keys)}, key_delay={key_delay_ms}ms")
     log(f"Commands loaded: {len(commands)}")
     return True
 
@@ -915,7 +923,7 @@ def grab_field_text():
         seq_after_clear = user32.GetClipboardSequenceNumber()
 
         send_keys("^a")
-        time.sleep(0.12)
+        time.sleep(key_delay)  # Ctrl+A needs time before Ctrl+C
         send_keys("^c")
 
         # Wait for clipboard sequence number to change from post-clear value
@@ -950,12 +958,12 @@ def paste_text(text):
         if not set_clipboard_silent(text):
             return False
         # Pre-paste delay: let clipboard fully commit before sending keys
-        time.sleep(0.10)
+        time.sleep(key_delay)  # Clipboard settle before Ctrl+A
         # Select All: Ctrl down, A down, A up, Ctrl up (with 10ms between each event)
         # Select all with delay for target app to process selection
         send_keys("^a")
         # Let target app process selection (100ms — proven safe for React/Electron/Discord)
-        time.sleep(0.10)
+        time.sleep(key_delay)  # Ctrl+A needs time before Ctrl+V
         # Paste: Ctrl+V
         send_keys("^v")
         time.sleep(0.02)
@@ -1002,7 +1010,7 @@ def do_transform(trigger_name, prompt):
         log(f"Input: {len(input_text)} chars")
 
         # Settle delay — let target app fully release clipboard after our Ctrl+C grab
-        time.sleep(0.10)
+        time.sleep(key_delay)  # Post-grab settle
 
         # Async API call
         result_holder = [None]
