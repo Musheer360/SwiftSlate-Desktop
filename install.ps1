@@ -241,7 +241,18 @@ if (-not (Test-Path $configPath)) {
 
     if ([string]::IsNullOrWhiteSpace($apiKey)) { Write-Host "  No API key." -ForegroundColor Red; return }
 
-    $cfg = @{ api_keys = @($apiKey); model = $model; provider = $provider; temperature = 0.5; prefix = "?" }
+    # --- Key delay (paste timing) ---
+    Write-Host ""
+    Write-Host "  Paste timing (how fast your machine handles text replacement):" -ForegroundColor Cyan
+    Write-Host "  [1] 100ms — Fast (high-end PC, no issues)" -ForegroundColor White
+    Write-Host "  [2] 200ms — Recommended (works on most machines)" -ForegroundColor White
+    Write-Host "  [3] 300ms — Safe (older/slower machines)" -ForegroundColor White
+    Write-Host "  [4] 400ms — Extra safe (if you still see glitches at 300)" -ForegroundColor White
+    Write-Host ""
+    $kd = Read-Host "  Timing [default: 2]"
+    $keyDelay = switch ($kd) { "1" { 100 } "3" { 300 } "4" { 400 } default { 200 } }
+
+    $cfg = @{ api_keys = @($apiKey); model = $model; provider = $provider; temperature = 0.5; prefix = "?"; key_delay = $keyDelay }
     if ($endpoint) { $cfg.endpoint = $endpoint }
     [System.IO.File]::WriteAllText($configPath, ($cfg | ConvertTo-Json -Depth 3), (New-Object System.Text.UTF8Encoding $false))
 }
