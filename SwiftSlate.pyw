@@ -32,10 +32,17 @@ CW_USEDEFAULT = 0x80000000
 user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
 
+# Pointer-sized types for 64-bit correctness
+LRESULT = wt.LPARAM  # LRESULT is pointer-sized (8 bytes on x64)
+ULONG_PTR = wt.WPARAM  # ULONG_PTR is pointer-sized
+
 # Properly declare Win32 function signatures for 64-bit correctness
+# -- Clipboard --
 user32.OpenClipboard.argtypes = [wt.HWND]
 user32.OpenClipboard.restype = wt.BOOL
+user32.CloseClipboard.argtypes = []
 user32.CloseClipboard.restype = wt.BOOL
+user32.EmptyClipboard.argtypes = []
 user32.EmptyClipboard.restype = wt.BOOL
 user32.GetClipboardData.argtypes = [wt.UINT]
 user32.GetClipboardData.restype = wt.HANDLE
@@ -45,6 +52,7 @@ user32.RegisterClipboardFormatW.argtypes = [wt.LPCWSTR]
 user32.RegisterClipboardFormatW.restype = wt.UINT
 user32.GetClipboardSequenceNumber.argtypes = []
 user32.GetClipboardSequenceNumber.restype = wt.DWORD
+# -- Memory --
 kernel32.GlobalAlloc.argtypes = [wt.UINT, ctypes.c_size_t]
 kernel32.GlobalAlloc.restype = wt.HANDLE
 kernel32.GlobalLock.argtypes = [wt.HANDLE]
@@ -53,6 +61,50 @@ kernel32.GlobalUnlock.argtypes = [wt.HANDLE]
 kernel32.GlobalUnlock.restype = wt.BOOL
 kernel32.GlobalFree.argtypes = [wt.HANDLE]
 kernel32.GlobalFree.restype = wt.HANDLE
+# -- Window --
+user32.CreateWindowExW.argtypes = [wt.DWORD, wt.LPCWSTR, wt.LPCWSTR, wt.DWORD,
+                                   ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                   wt.HWND, wt.HMENU, wt.HINSTANCE, wt.LPVOID]
+user32.CreateWindowExW.restype = wt.HWND
+user32.DefWindowProcW.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM]
+user32.DefWindowProcW.restype = LRESULT
+user32.RegisterClassExW.argtypes = [ctypes.c_void_p]
+user32.RegisterClassExW.restype = wt.ATOM
+user32.GetMessageW.argtypes = [ctypes.POINTER(wt.MSG), wt.HWND, wt.UINT, wt.UINT]
+user32.GetMessageW.restype = wt.BOOL
+user32.TranslateMessage.argtypes = [ctypes.POINTER(wt.MSG)]
+user32.TranslateMessage.restype = wt.BOOL
+user32.DispatchMessageW.argtypes = [ctypes.POINTER(wt.MSG)]
+user32.DispatchMessageW.restype = LRESULT
+user32.PostQuitMessage.argtypes = [ctypes.c_int]
+user32.PostQuitMessage.restype = None
+# -- Input --
+user32.GetForegroundWindow.argtypes = []
+user32.GetForegroundWindow.restype = wt.HWND
+user32.GetWindowThreadProcessId.argtypes = [wt.HWND, ctypes.POINTER(wt.DWORD)]
+user32.GetWindowThreadProcessId.restype = wt.DWORD
+kernel32.GetCurrentThreadId.argtypes = []
+kernel32.GetCurrentThreadId.restype = wt.DWORD
+user32.AttachThreadInput.argtypes = [wt.DWORD, wt.DWORD, wt.BOOL]
+user32.AttachThreadInput.restype = wt.BOOL
+user32.SendInput.argtypes = [wt.UINT, ctypes.c_void_p, ctypes.c_int]
+user32.SendInput.restype = wt.UINT
+user32.GetRawInputData.argtypes = [wt.HANDLE, wt.UINT, ctypes.c_void_p,
+                                   ctypes.POINTER(wt.UINT), wt.UINT]
+user32.GetRawInputData.restype = wt.UINT
+user32.RegisterRawInputDevices.argtypes = [ctypes.c_void_p, wt.UINT, wt.UINT]
+user32.RegisterRawInputDevices.restype = wt.BOOL
+# -- Keyboard --
+user32.GetKeyboardState.argtypes = [ctypes.POINTER(ctypes.c_ubyte)]
+user32.GetKeyboardState.restype = wt.BOOL
+user32.GetKeyboardLayout.argtypes = [wt.DWORD]
+user32.GetKeyboardLayout.restype = wt.HKL
+user32.ToUnicodeEx.argtypes = [wt.UINT, wt.UINT, ctypes.POINTER(ctypes.c_ubyte),
+                               wt.LPWSTR, ctypes.c_int, wt.UINT, wt.HKL]
+user32.ToUnicodeEx.restype = ctypes.c_int
+# -- Module --
+kernel32.GetModuleHandleW.argtypes = [wt.LPCWSTR]
+kernel32.GetModuleHandleW.restype = wt.HMODULE
 
 # --- Structures ---
 class RAWINPUTDEVICE(ctypes.Structure):
@@ -73,7 +125,7 @@ class RAWINPUT(ctypes.Structure):
 
 class WNDCLASSEXW(ctypes.Structure):
     _fields_ = [
-        ("cbSize", wt.UINT), ("style", wt.UINT), ("lpfnWndProc", ctypes.WINFUNCTYPE(ctypes.c_long, wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM)),
+        ("cbSize", wt.UINT), ("style", wt.UINT), ("lpfnWndProc", ctypes.WINFUNCTYPE(LRESULT, wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM)),
         ("cbClsExtra", ctypes.c_int), ("cbWndExtra", ctypes.c_int),
         ("hInstance", wt.HINSTANCE), ("hIcon", wt.HICON), ("hCursor", wt.HANDLE),
         ("hbrBackground", wt.HBRUSH), ("lpszMenuName", wt.LPCWSTR),
@@ -481,7 +533,11 @@ def _call_openai_compatible(text, system_content, key, endpoint):
 # --- Clipboard (silent, no history pollution) ---
 def set_clipboard_silent(text):
     """Set clipboard text, excluding from history. Returns True on success."""
-    if not user32.OpenClipboard(None):
+    # Use hwnd_main as clipboard owner so EmptyClipboard + SetClipboardData works correctly.
+    # Per MS docs, OpenClipboard(NULL) + EmptyClipboard sets owner to NULL, which can
+    # cause SetClipboardData to fail.
+    owner = hwnd_main or None
+    if not user32.OpenClipboard(owner):
         return False
     try:
         user32.EmptyClipboard()
@@ -543,11 +599,11 @@ def get_clipboard_text():
 # INPUT struct must include MOUSEINPUT in union for correct sizeof (40 bytes on x64)
 class _MOUSEINPUT(ctypes.Structure):
     _fields_ = [("dx", ctypes.c_long), ("dy", ctypes.c_long), ("mouseData", wt.DWORD),
-                ("dwFlags", wt.DWORD), ("time", wt.DWORD), ("dwExtraInfo", ctypes.POINTER(wt.ULONG))]
+                ("dwFlags", wt.DWORD), ("time", wt.DWORD), ("dwExtraInfo", ULONG_PTR)]
 
 class _KEYBDINPUT(ctypes.Structure):
     _fields_ = [("wVk", wt.WORD), ("wScan", wt.WORD), ("dwFlags", wt.DWORD),
-                ("time", wt.DWORD), ("dwExtraInfo", ctypes.POINTER(wt.ULONG))]
+                ("time", wt.DWORD), ("dwExtraInfo", ULONG_PTR)]
 
 class _HARDWAREINPUT(ctypes.Structure):
     _fields_ = [("uMsg", wt.DWORD), ("wParamL", wt.WORD), ("wParamH", wt.WORD)]
@@ -574,8 +630,7 @@ def _make_key(vk, flags=0):
     inp.union.ki.wScan = 0
     inp.union.ki.dwFlags = flags
     inp.union.ki.time = 0
-    # Cast integer to POINTER(ULONG) — Windows treats dwExtraInfo as an opaque ULONG_PTR
-    inp.union.ki.dwExtraInfo = ctypes.cast(ctypes.c_void_p(_SELF_INPUT_TAG), ctypes.POINTER(wt.ULONG))
+    inp.union.ki.dwExtraInfo = _SELF_INPUT_TAG
     return inp
 
 def send_keys(keys):
@@ -589,7 +644,9 @@ def send_keys(keys):
                 _make_key(vk, KEYEVENTF_KEYUP),
                 _make_key(VK_CONTROL, KEYEVENTF_KEYUP),
             )
-            user32.SendInput(4, ctypes.byref(inputs), ctypes.sizeof(INPUT))
+            sent = user32.SendInput(4, ctypes.byref(inputs), ctypes.sizeof(INPUT))
+            if sent != 4:
+                log(f"SendInput: only {sent}/4 events injected (UIPI or blocked)")
             time.sleep(0.01)
 
 # --- Grab text from active field ---
@@ -607,7 +664,8 @@ def grab_field_text():
 
     try:
         # Clear clipboard then record sequence number (EmptyClipboard changes it)
-        if user32.OpenClipboard(None):
+        owner = hwnd_main or None
+        if user32.OpenClipboard(owner):
             user32.EmptyClipboard()
             user32.CloseClipboard()
 
@@ -969,29 +1027,45 @@ def process_keystroke(vkey, scan_code):
     layout = user32.GetKeyboardLayout(tid)
 
     ret = user32.ToUnicodeEx(vkey, scan_code, key_state, char_buffer, 4, 0, layout)
-    if ret != 1:
+    if ret < 0:
+        # Dead key (diacritic) — ignore safely, don't corrupt buffer
+        return
+    if ret == 0:
+        # No translation for this key
         return
 
-    ch = char_buffer.value
-    if not ch:
+    # ret >= 1: one or more characters produced
+    chars = char_buffer.value[:ret] if ret > 1 else char_buffer.value
+    if not chars:
         return
 
-    # Ignore control characters (from Ctrl+key combos like our own paste_text SendInput)
-    if ord(ch) < 32:
-        return
+    # Process each character (handles multi-char output from ligatures etc.)
+    for ch in chars:
+        if not ch:
+            continue
 
-    keystroke_buffer.append(ch)
+        # Ignore control characters (from Ctrl+key combos like our own paste_text SendInput)
+        if ord(ch) < 32:
+            continue
+
+        keystroke_buffer.append(ch)
+
     if len(keystroke_buffer) > max_buffer_len:
         keystroke_buffer = keystroke_buffer[-max_buffer_len:]
+
+    # Use last appended character for trigger detection
+    if not keystroke_buffer:
+        return
+    last_ch = keystroke_buffer[-1]
 
     # If user types during processing, abort the spinner to preserve their input
     if processing and not abort_event.is_set():
         abort_event.set()
-        log(f"User typed '{ch}' during processing — aborting spinner")
+        log(f"User typed '{last_ch}' during processing — aborting spinner")
         return
 
     # Fast exit: last char not in trigger endings
-    if ch not in trigger_last_chars:
+    if last_ch not in trigger_last_chars:
         return
 
     # Check triggers
@@ -1088,7 +1162,7 @@ def main():
     log("Clipboard formats registered")
 
     # Create window class
-    WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_long, wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM)
+    WNDPROC = ctypes.WINFUNCTYPE(LRESULT, wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM)
     wnd_proc_cb = WNDPROC(wnd_proc)
 
     hinstance = kernel32.GetModuleHandleW(None)
