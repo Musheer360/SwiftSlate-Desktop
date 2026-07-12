@@ -201,7 +201,7 @@ All settings live in `%USERPROFILE%\.swiftslate\` and hot-reload automatically:
 | `prefix` | Trigger prefix character (default: `?`) |
 | `endpoint` | Required for `custom` provider (e.g., `http://localhost:11434/v1`) |
 | `key_delay` | Milliseconds between dependent keystrokes (default: `200`). Decrease to `100` on fast machines for snappier response, increase to `300` on very slow machines if text replacement glitches. The spinner animation speed automatically scales with this value. |
-| `spinner` | Progress indicator mode: `animated` (default), `static` (a fixed `◐` with zero animation keystrokes – the most reliable option for slow machines or machines under load), or `off` (no visual feedback). |
+| `spinner` | Progress indicator mode: `animated` (default — spinning ◐◓◑◒), `static` (shows `[Processing...]` with zero animation keystrokes — the most reliable option for slow machines), or `off` (no visual feedback). |
 
 <br>
 
