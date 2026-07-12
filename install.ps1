@@ -252,7 +252,9 @@ if (-not (Test-Path $configPath)) {
     $kd = Read-Host "  Timing [default: 2]"
     $keyDelay = switch ($kd) { "1" { 100 } "3" { 300 } "4" { 400 } default { 200 } }
 
-    $cfg = @{ api_keys = @($apiKey); model = $model; provider = $provider; temperature = 0.5; prefix = "?"; key_delay = $keyDelay }
+    # Slow machines get a static spinner (single paste, zero animation keystrokes) for maximum reliability
+    $spinner = if ($keyDelay -ge 300) { "static" } else { "animated" }
+    $cfg = @{ api_keys = @($apiKey); model = $model; provider = $provider; temperature = 0.5; prefix = "?"; key_delay = $keyDelay; spinner = $spinner }
     if ($endpoint) { $cfg.endpoint = $endpoint }
     [System.IO.File]::WriteAllText($configPath, ($cfg | ConvertTo-Json -Depth 3), (New-Object System.Text.UTF8Encoding $false))
 }

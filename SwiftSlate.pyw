@@ -14,6 +14,7 @@ import threading
 import time
 import urllib.request
 import urllib.error
+import urllib.parse
 
 # --- Win32 constants ---
 WM_INPUT = 0x00FF
@@ -188,6 +189,7 @@ abort_event = threading.Event()  # Set when user types during processing — abo
 last_original_text = None
 internal_clipboard = None
 spinner_frames = "\u25D0\u25D3\u25D1\u25D2"
+spinner_mode = "animated"  # animated | static | off
 hwnd_main = None
 
 # Provider settings
@@ -324,7 +326,7 @@ def _notify_debounced(message, icon=NIIF_INFO):
 def load_config():
     global config, commands, api_keys, model, prefix, translate_prefix
     global trigger_strings, trigger_last_chars
-    global provider, temperature, custom_endpoint, key_delay
+    global provider, temperature, custom_endpoint, key_delay, spinner_mode
 
     config_path = os.path.join(script_dir, "config.json")
 
@@ -369,9 +371,15 @@ def load_config():
     # Validate key_delay (ms between dependent keystrokes — increase on slow machines)
     key_delay_ms = config.get("key_delay", 200)
     if not isinstance(key_delay_ms, (int, float)):
-        key_delay_ms = 100
+        key_delay_ms = 200
     key_delay_ms = max(30, min(500, int(key_delay_ms)))  # Clamp 30-500ms
     key_delay = key_delay_ms / 1000.0  # Convert to seconds for time.sleep()
+
+    # Validate spinner mode (animated | static | off)
+    spinner_mode = config.get("spinner", "animated")
+    if spinner_mode not in ("animated", "static", "off"):
+        log(f"WARNING: Invalid spinner mode '{spinner_mode}', defaulting to animated")
+        spinner_mode = "animated"
 
     # Validate API keys
     if not api_keys or not any(k.strip() for k in api_keys if isinstance(k, str)):
@@ -397,6 +405,13 @@ def load_config():
         log(f"WARNING: Custom endpoint must start with http:// or https://")
         notify("SwiftSlate", "Custom endpoint URL is invalid.", NIIF_ERROR)
         provider = "groq"
+
+    if provider == "custom" and custom_endpoint.startswith("http://"):
+        # Plaintext HTTP is normal for local LLMs; warn only for remote hosts
+        host = custom_endpoint[7:].split("/")[0].split(":")[0].lower()
+        if host not in ("localhost", "127.0.0.1", "::1"):
+            log("WARNING: Custom endpoint uses plaintext HTTP - API key sent unencrypted")
+            notify("SwiftSlate", "Endpoint uses HTTP, not HTTPS. API key is sent unencrypted.", NIIF_WARNING)
 
     # Load commands
     commands_path = os.path.join(script_dir, "commands.json")
@@ -674,7 +689,7 @@ def call_api(text, prompt):
 
 def _call_gemini(text, system_content, key):
     """Call Google Gemini API (generateContent endpoint). Raises on HTTP errors."""
-    safe_model = model.replace("/", "%2F")
+    safe_model = urllib.parse.quote(model, safe="")
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{safe_model}:generateContent"
 
     body = json.dumps({
@@ -849,6 +864,28 @@ def _make_key(vk, flags=0):
     inp.union.ki.dwExtraInfo = _SELF_INPUT_TAG
     return inp
 
+_MODIFIER_VKS = (0x10, 0x11, 0x12, 0x5B, 0x5C)  # Shift, Ctrl, Alt, LWin, RWin
+
+def _user_modifiers_down():
+    """True if a physical modifier key is currently held.
+    Injecting Ctrl+V / Shift+Left while the user holds a real modifier merges
+    into unintended combos (e.g. Ctrl+Shift+Left = select word), which corrupts
+    the field. This is a primary source of rare glitches on any machine."""
+    for vk in _MODIFIER_VKS:
+        if user32.GetAsyncKeyState(vk) & 0x8000:
+            return True
+    return False
+
+def _wait_modifiers_released(timeout=1.0):
+    """Wait until all physical modifier keys are released (or timeout).
+    Returns True if it is safe to inject keystrokes."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not _user_modifiers_down():
+            return True
+        time.sleep(0.02)
+    return not _user_modifiers_down()
+
 def send_keys(keys):
     """Send key combinations. Supports ^a (ctrl+a), ^c (ctrl+c), ^v (ctrl+v)."""
     if keys.startswith("^") and len(keys) == 2:
@@ -922,6 +959,8 @@ def grab_field_text():
 
         seq_after_clear = user32.GetClipboardSequenceNumber()
 
+        # Never inject Ctrl+A/Ctrl+C while the user still holds a modifier key
+        _wait_modifiers_released(1.0)
         send_keys("^a")
         time.sleep(key_delay)  # Ctrl+A needs time before Ctrl+C
         send_keys("^c")
@@ -959,6 +998,8 @@ def paste_text(text):
             return False
         # Pre-paste delay: let clipboard fully commit before sending keys
         time.sleep(key_delay)  # Clipboard settle before Ctrl+A
+        # Never inject while the user physically holds a modifier key
+        _wait_modifiers_released(1.0)
         # Select All: Ctrl down, A down, A up, Ctrl up (with 10ms between each event)
         # Select all with delay for target app to process selection
         send_keys("^a")
@@ -1031,18 +1072,24 @@ def do_transform(trigger_name, prompt):
         # If frame 0 fails: wait silently (zero field modification)
         # If _replace_last_char fails: freeze spinner (no corruption)
         MAX_SPINNER_SECONDS = 45
+        # Animation interval scales with key_delay: slow machines animate slower,
+        # widening the safety margin for the target app to process each
+        # Shift+Left+char replace before the next one arrives. This is the key
+        # to predictable behavior on slow machines or machines under load.
+        SPINNER_INTERVAL = max(0.3, key_delay * 1.5)
         frame = 0
         window_changed = False
         aborted = False
         timed_out = False
         abort_event.clear()
         spinner_start = time.time()
+        last_frame_time = 0.0
         spinner_active = False  # True once frame 0 paste succeeds
 
         # Frame 0: paste text+spinner into the EXISTING selection from grab_field_text
         # Key insight: grab_field_text did Ctrl+A+Ctrl+C, so text is still selected.
         # We only need Ctrl+V (no Ctrl+A) — eliminates the Chromium Ctrl+A race.
-        if user32.GetForegroundWindow() == hwnd:
+        if spinner_mode != "off" and user32.GetForegroundWindow() == hwnd and _wait_modifiers_released(0.5):
             spinner_text = input_text + " " + spinner_frames[0]
             seq_before = user32.GetClipboardSequenceNumber()
             if set_clipboard_silent(spinner_text):
@@ -1061,6 +1108,7 @@ def do_transform(trigger_name, prompt):
                     if sent == 4:
                         spinner_active = True
                         frame = 1
+                        last_frame_time = time.time()
                         time.sleep(0.02)
                         log("Spinner started (paste into selection)")
                     else:
@@ -1086,27 +1134,34 @@ def do_transform(trigger_name, prompt):
                 break
             # Window changed
             if user32.GetForegroundWindow() != hwnd:
+                # CRITICAL: never inject keystrokes here. SendInput targets the
+                # NEW foreground window and would overwrite its content.
                 log("Window changed, waiting silently")
                 window_changed = True
-                if spinner_active:
-                    paste_text(input_text)
                 done_event.wait(timeout=MAX_SPINNER_SECONDS)
                 break
 
-            # Animate only if spinner is active
-            if spinner_active:
+            # Animate only when active, in animated mode, and on schedule
+            if spinner_active and spinner_mode == "animated":
                 if abort_event.is_set():
                     aborted = True
                     break
-                spinner = spinner_frames[frame % 4]
-                if not _replace_last_char(spinner):
-                    # Failed — freeze animation, wait silently (never fall back to paste_text)
-                    log("Spinner frozen: _replace_last_char failed")
-                    done_event.wait(timeout=MAX_SPINNER_SECONDS - (time.time() - spinner_start))
-                    break
-                frame += 1
+                now = time.time()
+                if (now - last_frame_time) >= SPINNER_INTERVAL:
+                    if _user_modifiers_down():
+                        # User is holding Ctrl/Shift/Alt/Win. Injecting Shift+Left
+                        # now would merge into an unintended combo. Skip this frame.
+                        pass
+                    elif _replace_last_char(spinner_frames[frame % 4]):
+                        frame += 1
+                        last_frame_time = now
+                    else:
+                        # Failed: freeze animation, wait silently (never fall back to paste_text)
+                        log("Spinner frozen: _replace_last_char failed")
+                        done_event.wait(timeout=MAX_SPINNER_SECONDS - (time.time() - spinner_start))
+                        break
 
-            done_event.wait(timeout=0.2)
+            done_event.wait(timeout=0.15)
 
         # Paste result
         result = result_holder[0]
@@ -1404,7 +1459,7 @@ def _process_keystroke_inner(vkey, scan_code):
     # If user types during processing, abort the spinner to preserve their input
     if processing and not abort_event.is_set():
         abort_event.set()
-        log(f"User typed '{last_ch}' during processing — aborting spinner")
+        log("User typed during processing — aborting spinner")
         return
 
     # Fast exit: last char not in trigger endings
