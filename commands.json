@@ -11,5 +11,5 @@
 
   { "trigger": "date", "type": "replacer-shell", "value": "powershell -NoProfile -Command \"Get-Date -Format 'dddd, MMMM dd, yyyy'\"" },
   { "trigger": "time", "type": "replacer-shell", "value": "powershell -NoProfile -Command \"Get-Date -Format 'hh:mm tt'\"" },
-  { "trigger": "ip", "type": "replacer-shell", "value": "curl -s ifconfig.me" }
+  { "trigger": "ip", "type": "replacer-shell", "value": "curl -s https://ifconfig.me" }
 ]

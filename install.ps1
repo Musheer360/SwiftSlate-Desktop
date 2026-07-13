@@ -12,7 +12,13 @@ $repoFallback = "https://raw.githubusercontent.com/Musheer360/SwiftSlate-Desktop
 $repoApi = "https://api.github.com/repos/Musheer360/SwiftSlate-Desktop/contents"
 
 # Ensure TLS 1.2+ (older Windows/PowerShell may default to TLS 1.0 which many CDNs reject)
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
+# Tls13 is not defined on older .NET Framework builds - referencing it there throws,
+# which crashed the installer on exactly the systems this line was meant to help.
+try {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
+} catch {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+}
 
 # --- Helper: download with CDN fallback ---
 function Get-File {

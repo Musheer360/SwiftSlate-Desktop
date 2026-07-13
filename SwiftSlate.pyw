@@ -274,6 +274,14 @@ def notify(title, message, icon=NIIF_INFO):
     icon: NIIF_INFO (blue), NIIF_WARNING (yellow), NIIF_ERROR (red)
     """
     if not hwnd_main:
+        # No window yet (startup failure path). Fall back to a message box so
+        # errors are not silently swallowed when running under pythonw.exe.
+        if icon in (NIIF_ERROR, NIIF_WARNING):
+            mb_icon = 0x10 if icon == NIIF_ERROR else 0x30
+            try:
+                user32.MessageBoxW(None, message, title, mb_icon)
+            except Exception:
+                pass
         return
     try:
         _ensure_notify_icon()
@@ -350,11 +358,22 @@ def load_config():
         return False
 
     api_keys = config.get("api_keys", [])
+    if not isinstance(api_keys, list):
+        # A string here would be iterated character-by-character downstream
+        log("ERROR: api_keys in config.json must be a list")
+        api_keys = []
     model = config.get("model", "llama-3.3-70b-versatile")
+    if not isinstance(model, str) or not model.strip():
+        log("WARNING: Invalid model value, defaulting to llama-3.3-70b-versatile")
+        model = "llama-3.3-70b-versatile"
     prefix = config.get("prefix", "?")
     provider = config.get("provider", "groq")
     temperature = config.get("temperature", 0.5)
     custom_endpoint = config.get("endpoint", "")
+    if not isinstance(custom_endpoint, str):
+        # A non-string endpoint would crash .startswith() validation below
+        log("WARNING: Invalid endpoint value, ignoring")
+        custom_endpoint = ""
     translate_prefix = prefix + "translate:"
 
     # Validate prefix
@@ -413,22 +432,30 @@ def load_config():
             log("WARNING: Custom endpoint uses plaintext HTTP - API key sent unencrypted")
             notify("SwiftSlate", "Endpoint uses HTTP, not HTTPS. API key is sent unencrypted.", NIIF_WARNING)
 
-    # Load commands
+    # Load commands into FRESH containers, then atomically swap the global
+    # references at the end. The message-loop thread iterates these dicts on
+    # every keystroke; mutating them in place from the watcher thread could
+    # raise "RuntimeError: dictionary changed size during iteration" and
+    # silently kill trigger detection for that keystroke.
+    new_commands = {}
     commands_path = os.path.join(script_dir, "commands.json")
     if os.path.exists(commands_path):
         try:
             with open(commands_path, "r", encoding="utf-8-sig") as f:
                 cmd_list = json.load(f)
+            if not isinstance(cmd_list, list):
+                log("WARNING: commands.json must contain a list, ignoring")
+                cmd_list = []
             for cmd in cmd_list:
                 if not isinstance(cmd, dict) or "trigger" not in cmd:
                     continue  # Skip malformed entries
                 trigger = cmd["trigger"]
                 if not isinstance(trigger, str) or not trigger.strip():
                     continue
-                if trigger in commands:
+                if trigger in new_commands:
                     log(f"WARNING: Duplicate trigger '{trigger}' in commands.json (overwritten)")
                 cmd_type = cmd.get("type", "ai")
-                commands[trigger] = {
+                new_commands[trigger] = {
                     "type": cmd_type,
                     "prompt": cmd.get("prompt", ""),
                     "value": cmd.get("value", ""),
@@ -441,17 +468,26 @@ def load_config():
 
     # System commands
     for s in ("undo", "copy", "cut", "paste", "replace"):
-        if s not in commands:
-            commands[s] = {"type": "system", "prompt": "", "value": ""}
+        if s not in new_commands:
+            new_commands[s] = {"type": "system", "prompt": "", "value": ""}
 
     # Pre-compute trigger strings and last chars
-    for t in commands:
+    new_trigger_strings = {}
+    new_trigger_last_chars = set()
+    for t in new_commands:
         full = prefix + t
-        trigger_strings[t] = full
-        trigger_last_chars.add(full[-1])
+        new_trigger_strings[t] = full
+        new_trigger_last_chars.add(full[-1])
     # translate:XX ends in any letter
     for c in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ":
-        trigger_last_chars.add(c)
+        new_trigger_last_chars.add(c)
+
+    # Atomic swap: rebinding a global reference is atomic under the GIL, so the
+    # message-loop thread always sees either the old or the new complete set,
+    # never a half-built one.
+    commands = new_commands
+    trigger_strings = new_trigger_strings
+    trigger_last_chars = new_trigger_last_chars
 
     log(f"Config loaded: model={model}, prefix={prefix}, keys={len(api_keys)}, key_delay={key_delay_ms}ms")
     log(f"Commands loaded: {len(commands)}")
@@ -483,21 +519,18 @@ def _start_file_watcher():
                 ct = os.path.getmtime(config_path) if os.path.exists(config_path) else 0
                 cm = os.path.getmtime(commands_path) if os.path.exists(commands_path) else 0
 
-                if ct > _config_mtime or cm > _commands_mtime:
+                # Use != (not >) so restoring a backup file with an older
+                # mtime still triggers a reload
+                if ct != _config_mtime or cm != _commands_mtime:
                     changed = True
 
                 if changed and not processing:
-                    # Save old state as backup
-                    old_commands = dict(commands)
-                    old_triggers = dict(trigger_strings)
-                    old_last_chars = set(trigger_last_chars)
                     old_keys = list(api_keys)
 
-                    # Rebuild into globals (load_config populates them)
-                    commands.clear()
-                    trigger_strings.clear()
-                    trigger_last_chars.clear()
-
+                    # load_config builds fresh structures and swaps them in
+                    # atomically on success. On failure the previous working
+                    # trigger set is left untouched, so there is no longer a
+                    # window where the live dicts are cleared mid-keystroke.
                     if load_config():
                         _config_mtime = ct
                         _commands_mtime = cm
@@ -508,11 +541,12 @@ def _start_file_watcher():
                         log("Hot reload: config/commands reloaded")
                         _notify_debounced("Config reloaded.", NIIF_INFO)
                     else:
-                        # Restore previous working state
-                        commands.update(old_commands)
-                        trigger_strings.update(old_triggers)
-                        trigger_last_chars.update(old_last_chars)
-                        log("Hot reload: config invalid, restored previous state")
+                        # Record mtimes so a persistently-broken file is not
+                        # re-parsed (and re-notified) every 2 seconds; the next
+                        # save changes the mtime and retriggers a reload
+                        _config_mtime = ct
+                        _commands_mtime = cm
+                        log("Hot reload: config invalid, kept previous state")
                         _notify_debounced("Config error \u2014 using previous settings.", NIIF_WARNING)
                 elif changed and processing:
                     # Don't update mtimes — retry on next tick
@@ -960,9 +994,12 @@ def grab_field_text():
         seq_after_clear = user32.GetClipboardSequenceNumber()
 
         # Never inject Ctrl+A/Ctrl+C while the user still holds a modifier key
-        _wait_modifiers_released(1.0)
+        if not _wait_modifiers_released(1.0) or user32.GetForegroundWindow() != fg:
+            return None, prev
         send_keys("^a")
         time.sleep(key_delay)  # Ctrl+A needs time before Ctrl+C
+        if user32.GetForegroundWindow() != fg:
+            return None, prev
         send_keys("^c")
 
         # Wait for clipboard sequence number to change from post-clear value
@@ -998,14 +1035,14 @@ def paste_text(text):
             return False
         # Pre-paste delay: let clipboard fully commit before sending keys
         time.sleep(key_delay)  # Clipboard settle before Ctrl+A
-        # Never inject while the user physically holds a modifier key
-        _wait_modifiers_released(1.0)
-        # Select All: Ctrl down, A down, A up, Ctrl up (with 10ms between each event)
-        # Select all with delay for target app to process selection
+        # Focus can change during any delay. Never send the remaining keys to
+        # a newly focused window, where they could overwrite unrelated text.
+        if not _wait_modifiers_released(1.0) or user32.GetForegroundWindow() != fg:
+            return False
         send_keys("^a")
-        # Let target app process selection (100ms — proven safe for React/Electron/Discord)
         time.sleep(key_delay)  # Ctrl+A needs time before Ctrl+V
-        # Paste: Ctrl+V
+        if user32.GetForegroundWindow() != fg:
+            return False
         send_keys("^v")
         time.sleep(0.02)
         return True
@@ -1081,7 +1118,8 @@ def do_transform(trigger_name, prompt):
         window_changed = False
         aborted = False
         timed_out = False
-        abort_event.clear()
+        # abort_event is cleared in handle_trigger (before processing starts),
+        # so keystrokes typed between trigger detection and this point count
         spinner_start = time.time()
         last_frame_time = 0.0
         spinner_active = False  # True once frame 0 paste succeeds
@@ -1090,8 +1128,7 @@ def do_transform(trigger_name, prompt):
         # Key insight: grab_field_text did Ctrl+A+Ctrl+C, so text is still selected.
         # We only need Ctrl+V (no Ctrl+A) — eliminates the Chromium Ctrl+A race.
         if spinner_mode != "off" and user32.GetForegroundWindow() == hwnd and _wait_modifiers_released(0.5):
-            spinner_suffix = " [Processing...]" if spinner_mode == "static" else " " + spinner_frames[0]
-            spinner_text = input_text + spinner_suffix
+            spinner_text = input_text + " " + spinner_frames[0]
             seq_before = user32.GetClipboardSequenceNumber()
             if set_clipboard_silent(spinner_text):
                 seq_after = user32.GetClipboardSequenceNumber()
@@ -1216,7 +1253,7 @@ def do_transform(trigger_name, prompt):
     finally:
         # Always restore clipboard and release processing
         time.sleep(0.2)
-        if prev_clip:
+        if prev_clip is not None:
             set_clipboard_silent(prev_clip)
         processing = False
         log("--- Done ---")
@@ -1334,6 +1371,11 @@ def do_replacer(trigger_name, cmd_type, value):
 # --- Trigger handler ---
 def handle_trigger(trigger_name):
     global processing
+    # Clear the abort signal BEFORE processing starts. Previously it was
+    # cleared inside do_transform after the worker thread spun up, so a user
+    # keystroke landing in that window set the event and was then wiped,
+    # losing a legitimate abort.
+    abort_event.clear()
     processing = True
     log(f"Trigger: ?{trigger_name}")
 
