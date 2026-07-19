@@ -1128,7 +1128,12 @@ def do_transform(trigger_name, prompt):
         # Key insight: grab_field_text did Ctrl+A+Ctrl+C, so text is still selected.
         # We only need Ctrl+V (no Ctrl+A) — eliminates the Chromium Ctrl+A race.
         if spinner_mode != "off" and user32.GetForegroundWindow() == hwnd and _wait_modifiers_released(0.5):
-            spinner_text = input_text + " " + spinner_frames[0]
+            # static mode shows a fixed "[Processing...]" label (never animated);
+            # animated mode starts on frame 0 of the spinner glyph cycle
+            if spinner_mode == "static":
+                spinner_text = input_text + " [Processing...]"
+            else:
+                spinner_text = input_text + " " + spinner_frames[0]
             seq_before = user32.GetClipboardSequenceNumber()
             if set_clipboard_silent(spinner_text):
                 seq_after = user32.GetClipboardSequenceNumber()
