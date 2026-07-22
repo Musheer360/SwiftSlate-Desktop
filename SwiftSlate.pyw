@@ -816,8 +816,7 @@ def _call_openai_compatible(text, system_content, key, endpoint):
             {"role": "system", "content": system_content},
             {"role": "user", "content": wrap_user_text(text)}
         ],
-        "temperature": temperature,
-        "max_tokens": 2048
+        "temperature": temperature
     }
 
     # Per-model reasoning params (mirrors Android's GroqModels.reasoningParams).
