@@ -30,6 +30,28 @@ Type a trigger like **`?fix`** at the end of any text, in any app, and watch it 
 
 <br>
 
+## 📋 Table of Contents
+
+- [Quick Demo](#-quick-demo)
+- [Features](#-features)
+- [Getting Started](#-getting-started)
+- [Built-in Commands](#-built-in-commands)
+- [Supported AI Providers](#-supported-ai-providers)
+- [API Key Management](#-api-key-management)
+- [Configuration](#%EF%B8%8F-configuration)
+- [Custom Commands](#%EF%B8%8F-custom-commands)
+- [How It Works](#-how-it-works)
+- [Debug Mode](#-debug-mode)
+- [Privacy & Security](#-privacy--security)
+- [Tech Stack](#%EF%B8%8F-tech-stack)
+- [Building from Source](#-building-from-source)
+- [Known Limitations](#%EF%B8%8F-known-limitations)
+- [Contributing](#-contributing)
+- [Support the Project](#-support-the-project)
+- [License](#-license)
+
+<br>
+
 ## ⚡ Quick Demo
 
 ```
@@ -291,6 +313,19 @@ This runs in the foreground with full logging — shows every keystroke match, A
 
 <br>
 
+## 🔒 Privacy & Security
+
+| | Concern | How SwiftSlate Desktop Handles It |
+|:--|:--------|:------------------------|
+| 👁️ | **Text Monitoring** | Only processes text when a trigger command is detected at the end of the keystroke buffer. All other typing is completely ignored. |
+| 📡 | **Data Transmission** | Text is sent **only** to the configured AI provider (Groq, Google Gemini, or your custom endpoint). No other servers are ever contacted. Text replacer commands never leave your machine. |
+| 📊 | **Analytics** | **None.** Zero telemetry, zero tracking, zero crash reporting. |
+| 📖 | **Open Source** | The entire codebase is open for inspection under the MIT License. |
+| 🔑 | **Permissions** | Runs as a standard user process — no admin/elevated privileges required. |
+| 📋 | **Clipboard Safety** | All clipboard operations use Windows exclusion flags to prevent pollution of clipboard history and cloud sync. |
+
+<br>
+
 ## 🏗️ Tech Stack
 
 <table>
@@ -305,6 +340,84 @@ This runs in the foreground with full logging — shows every keystroke match, A
 </table>
 
 > **Zero third-party dependencies** — uses only Python standard library and Windows APIs via ctypes.
+
+<br>
+
+## 🔨 Building from Source
+
+### Prerequisites
+
+- **Windows 10/11** (64-bit)
+- **Python 3.10+** (or use the embedded runtime from the installer)
+
+### Run
+
+```powershell
+# Clone the repository
+git clone https://github.com/Musheer360/SwiftSlate-Desktop.git
+cd SwiftSlate-Desktop
+
+# Run in debug mode
+python SwiftSlate.pyw --debug
+```
+
+### Verify Syntax
+
+```powershell
+python -c "import py_compile; py_compile.compile('SwiftSlate.pyw', doraise=True)"
+```
+
+> [!NOTE]
+> The entire app is a single `SwiftSlate.pyw` file with zero pip dependencies. No build step required.
+
+<br>
+
+## ⚠️ Known Limitations
+
+- **Text replacement uses Ctrl+A → Ctrl+V** — this selects all and pastes, which works in most standard text fields. In apps with non-standard input handling (e.g., some terminal emulators, certain game overlays), replacement may not work as expected.
+- **Single-line buffer** — SwiftSlate tracks keystrokes in a buffer that clears on window switch, Enter, Escape, and Tab. Triggers must be typed in a single uninterrupted sequence within the same field.
+- **Windows only** — currently requires Windows 10/11. Linux support is planned.
+
+<br>
+
+## 🤝 Contributing
+
+Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for full details.
+
+```bash
+# 1. Fork the repository, then:
+git clone https://github.com/YOUR_USERNAME/SwiftSlate-Desktop.git
+cd SwiftSlate-Desktop
+
+# 2. Create a feature branch
+git checkout -b feature/amazing-feature
+
+# 3. Make your changes and test
+python SwiftSlate.pyw --debug
+
+# 4. Verify syntax
+python -c "import py_compile; py_compile.compile('SwiftSlate.pyw', doraise=True)"
+
+# 5. Push and open a Pull Request
+git push origin feature/amazing-feature
+```
+
+### Ideas for Contributions
+
+- 🐧 Linux support (porting keystroke detection and text replacement)
+- 🧩 New built-in commands
+- 🤖 Additional AI provider integrations
+- 🐛 Bug fixes for text replacement edge cases
+- 📖 Documentation improvements
+
+<br>
+
+## ❤️ Support the Project
+
+SwiftSlate Desktop is free, open source, and built in my spare time. If it's useful to you, consider supporting its development:
+
+- ⭐ **Star this repo** — it helps others discover SwiftSlate
+- 💖 [**Sponsor on GitHub**](https://github.com/sponsors/Musheer360) — even a small contribution keeps the project going
 
 <br>
 
