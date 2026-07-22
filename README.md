@@ -124,7 +124,7 @@ Run the same command again to **update** or **uninstall**.
 | Requirement | Details |
 |:------------|:--------|
 | **Windows** | Windows 10 or 11 (64-bit) |
-| **API Key** | Free Groq key at [console.groq.com/keys](https://console.groq.com/keys), or Gemini at [aistudio.google.com](https://aistudio.google.com/api-keys), or any OpenAI-compatible provider. *Not required for text replacer commands.* |
+| **API Key** | Free Gemini key at [aistudio.google.com](https://aistudio.google.com/api-keys), or Groq at [console.groq.com/keys](https://console.groq.com/keys), or any OpenAI-compatible provider. *Not required for text replacer commands.* |
 
 > [!NOTE]
 > Python is **not** required on your system. If not found, the installer downloads an embedded Python runtime (~15 MB) that lives entirely inside the `.swiftslate` folder.
@@ -172,8 +172,8 @@ SwiftSlate ships with **10 AI-powered commands**, dynamic translation, and **cli
 
 | Provider | Recommended Models | Notes |
 |:---------|:-------|:------|
-| **Groq** (default) | `openai/gpt-oss-120b` (default), `qwen/qwen3.6-27b` | Free tier at [console.groq.com](https://console.groq.com/keys). Per-model reasoning params applied automatically. |
-| **Google Gemini** | `gemini-3.5-flash-lite` (default), `gemini-3.6-flash` | Free tier at [aistudio.google.com](https://aistudio.google.com/api-keys). Thinking level set to `minimal` for fast inline transforms. |
+| **Google Gemini** (default) | `gemini-3.5-flash-lite` (default), `gemini-3.6-flash` | Free tier at [aistudio.google.com](https://aistudio.google.com/api-keys). Thinking level set to `minimal` for fast inline transforms. |
+| **Groq** | `openai/gpt-oss-120b` (default), `qwen/qwen3.6-27b` | Free tier at [console.groq.com](https://console.groq.com/keys). Per-model reasoning params applied automatically. |
 | **Custom (OpenAI-compatible)** | Any model your endpoint supports | Works with Ollama, LM Studio, vLLM, any `/v1/chat/completions` endpoint |
 
 > [!TIP]
@@ -205,8 +205,8 @@ All settings live in `%USERPROFILE%\.swiftslate\` and hot-reload automatically:
 ```json
 {
   "api_keys": ["your-key-1", "your-key-2"],
-  "model": "openai/gpt-oss-120b",
-  "provider": "groq",
+  "model": "gemini-3.5-flash-lite",
+  "provider": "gemini",
   "temperature": 0.5,
   "prefix": "?",
   "key_delay": 200,

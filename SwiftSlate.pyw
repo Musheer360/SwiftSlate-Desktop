@@ -193,7 +193,7 @@ spinner_mode = "animated"  # animated | static | off
 hwnd_main = None
 
 # Provider settings
-provider = "groq"  # groq, gemini, custom
+provider = "gemini"  # groq, gemini, custom
 temperature = 0.5
 custom_endpoint = ""
 key_delay = 0.20  # Seconds between dependent keystroke operations (Ctrl+A → Ctrl+V, etc.)
@@ -404,7 +404,7 @@ def load_config():
         log(f"WARNING: Invalid model value, defaulting to {default_model}")
         model = default_model
     prefix = config.get("prefix", "?")
-    provider = config.get("provider", "groq")
+    provider = config.get("provider", "gemini")
     temperature = config.get("temperature", 0.5)
     custom_endpoint = config.get("endpoint", "")
     if not isinstance(custom_endpoint, str):
@@ -449,18 +449,18 @@ def load_config():
     api_keys = [k for k in api_keys if isinstance(k, str) and k.strip()]
 
     if provider not in ("groq", "gemini", "custom"):
-        log(f"WARNING: Unknown provider '{provider}', defaulting to groq")
-        provider = "groq"
+        log(f"WARNING: Unknown provider '{provider}', defaulting to gemini")
+        provider = "gemini"
 
     if provider == "custom" and not custom_endpoint:
-        log("WARNING: Custom provider but no endpoint set, defaulting to groq")
+        log("WARNING: Custom provider but no endpoint set, defaulting to gemini")
         notify("SwiftSlate", "Custom provider set but no endpoint configured.", NIIF_WARNING)
-        provider = "groq"
+        provider = "gemini"
 
     if provider == "custom" and custom_endpoint and not custom_endpoint.startswith(("http://", "https://")):
         log(f"WARNING: Custom endpoint must start with http:// or https://")
         notify("SwiftSlate", "Custom endpoint URL is invalid.", NIIF_ERROR)
-        provider = "groq"
+        provider = "gemini"
 
     if provider == "custom" and custom_endpoint.startswith("http://"):
         # Plaintext HTTP is normal for local LLMs; warn only for remote hosts
