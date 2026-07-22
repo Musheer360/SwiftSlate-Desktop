@@ -93,7 +93,7 @@ Add multiple API keys for automatic round-robin rotation. If one key hits a rate
 <td width="50%">
 
 ### 🤖 Multi-Provider AI
-Ships with Groq, Google Gemini, or connect **any OpenAI-compatible endpoint** — cloud providers, or **local LLMs** like [Ollama](https://ollama.com), [LM Studio](https://lmstudio.ai), and others running locally.
+Ships with Google Gemini, Groq, or connect **any OpenAI-compatible endpoint** — cloud providers, or **local LLMs** like [Ollama](https://ollama.com), [LM Studio](https://lmstudio.ai), and others running locally.
 
 ### 🛠️ Two Command Types
 **AI commands** send text to your provider for intelligent transformation. **Text replacer commands** run entirely offline for instant local text manipulation — no API key needed.
@@ -318,7 +318,7 @@ This runs in the foreground with full logging — shows every keystroke match, A
 | | Concern | How SwiftSlate Desktop Handles It |
 |:--|:--------|:------------------------|
 | 👁️ | **Text Monitoring** | Only processes text when a trigger command is detected at the end of the keystroke buffer. All other typing is completely ignored. |
-| 📡 | **Data Transmission** | Text is sent **only** to the configured AI provider (Groq, Google Gemini, or your custom endpoint). No other servers are ever contacted. Text replacer commands never leave your machine. |
+| 📡 | **Data Transmission** | Text is sent **only** to the configured AI provider (Google Gemini, Groq, or your custom endpoint). No other servers are ever contacted. Text replacer commands never leave your machine. |
 | 📊 | **Analytics** | **None.** Zero telemetry, zero tracking, zero crash reporting. |
 | 📖 | **Open Source** | The entire codebase is open for inspection under the MIT License. |
 | 🔑 | **Permissions** | Runs as a standard user process — no admin/elevated privileges required. |
