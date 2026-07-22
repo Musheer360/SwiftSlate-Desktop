@@ -239,7 +239,7 @@ GEMINI_MODEL_PARAMS = {
     "gemini-3.5-flash-lite": {"thinkingLevel": "minimal"},
     "gemini-3.6-flash": {"thinkingLevel": "minimal"},
 }
-DEFAULT_GROQ_MODEL = "qwen/qwen3.6-27b"
+DEFAULT_GROQ_MODEL = "openai/gpt-oss-120b"
 DEFAULT_GEMINI_MODEL = "gemini-3.5-flash-lite"
 
 # Pre-allocated buffers for keystroke processing
