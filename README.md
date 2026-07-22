@@ -148,10 +148,10 @@ SwiftSlate ships with **10 AI-powered commands**, dynamic translation, and **cli
 
 ## 🤖 Supported AI Providers
 
-| Provider | Models | Notes |
+| Provider | Recommended Models | Notes |
 |:---------|:-------|:------|
-| **Groq** (default) | `llama-3.3-70b-versatile`, `llama-3.1-8b-instant`, `openai/gpt-oss-120b`, `openai/gpt-oss-20b`, `meta-llama/llama-4-scout-17b-16e-instruct` | Free tier at [console.groq.com](https://console.groq.com/keys) |
-| **Google Gemini** | `gemini-2.5-flash-lite`, `gemini-3-flash-preview`, `gemini-3.1-flash-lite-preview` | Free tier at [aistudio.google.com](https://aistudio.google.com/api-keys) |
+| **Groq** (default) | `qwen/qwen3.6-27b` (default), `openai/gpt-oss-120b` | Free tier at [console.groq.com](https://console.groq.com/keys). Per-model reasoning params applied automatically. |
+| **Google Gemini** | `gemini-3.5-flash-lite` (default), `gemini-3.6-flash` | Free tier at [aistudio.google.com](https://aistudio.google.com/api-keys). Thinking level set to `minimal` for fast inline transforms. |
 | **Custom (OpenAI-compatible)** | Any model your endpoint supports | Works with Ollama, LM Studio, vLLM, any `/v1/chat/completions` endpoint |
 
 > [!TIP]
@@ -183,9 +183,9 @@ All settings live in `%USERPROFILE%\.swiftslate\` and hot-reload automatically:
 ```json
 {
   "api_keys": ["your-key-1", "your-key-2"],
-  "model": "llama-3.3-70b-versatile",
+  "model": "qwen/qwen3.6-27b",
   "provider": "groq",
-  "temperature": 0.3,
+  "temperature": 0.5,
   "prefix": "?",
   "key_delay": 200,
   "spinner": "animated"
