@@ -195,27 +195,26 @@ $configPath = Join-Path $installDir "config.json"
 if (-not (Test-Path $configPath)) {
     Write-Host ""
     Write-Host "  Provider:" -ForegroundColor DarkGray
-    Write-Host "  [1] Groq    (free, recommended)" -ForegroundColor White
-    Write-Host "  [2] Gemini  (free tier)" -ForegroundColor White
+    Write-Host "  [1] Gemini  (free tier, recommended)" -ForegroundColor White
+    Write-Host "  [2] Groq    (free tier)" -ForegroundColor White
     Write-Host "  [3] Custom  (OpenAI-compatible)" -ForegroundColor White
     Write-Host ""
     $prov = Read-Host "  Choice [default: 1]"
 
-    $provider = "groq"; $endpoint = ""; $model = ""; $apiKey = ""
+    $provider = "gemini"; $endpoint = ""; $model = ""; $apiKey = ""
 
     switch ($prov) {
         "2" {
-            $provider = "gemini"
-            Write-Host ""; Write-Host "  Key: https://aistudio.google.com/api-keys" -ForegroundColor Yellow
+            $provider = "groq"
+            Write-Host ""; Write-Host "  Key: https://console.groq.com/keys" -ForegroundColor Yellow
             Write-Host ""
             $apiKey = Read-Host "  API Key"
             Write-Host ""
-            Write-Host "  [1] gemini-2.5-flash-lite (default)" -ForegroundColor White
-            Write-Host "  [2] gemini-3-flash-preview" -ForegroundColor White
-            Write-Host "  [3] gemini-3.1-flash-lite-preview" -ForegroundColor White
+            Write-Host "  [1] openai/gpt-oss-120b (default)" -ForegroundColor White
+            Write-Host "  [2] qwen/qwen3.6-27b" -ForegroundColor White
             Write-Host ""
             $m = Read-Host "  Model [default: 1]"
-            $model = switch ($m) { "2" { "gemini-3-flash-preview" } "3" { "gemini-3.1-flash-lite-preview" } default { "gemini-2.5-flash-lite" } }
+            $model = switch ($m) { "2" { "qwen/qwen3.6-27b" } default { "openai/gpt-oss-120b" } }
         }
         "3" {
             $provider = "custom"
@@ -229,19 +228,16 @@ if (-not (Test-Path $configPath)) {
             if ([string]::IsNullOrWhiteSpace($model)) { $model = "default" }
         }
         default {
-            $provider = "groq"
-            Write-Host ""; Write-Host "  Key: https://console.groq.com/keys" -ForegroundColor Yellow
+            $provider = "gemini"
+            Write-Host ""; Write-Host "  Key: https://aistudio.google.com/api-keys" -ForegroundColor Yellow
             Write-Host ""
             $apiKey = Read-Host "  API Key"
             Write-Host ""
-            Write-Host "  [1] llama-3.3-70b-versatile (default)" -ForegroundColor White
-            Write-Host "  [2] llama-3.1-8b-instant" -ForegroundColor White
-            Write-Host "  [3] openai/gpt-oss-120b" -ForegroundColor White
-            Write-Host "  [4] openai/gpt-oss-20b" -ForegroundColor White
-            Write-Host "  [5] meta-llama/llama-4-scout-17b-16e-instruct" -ForegroundColor White
+            Write-Host "  [1] gemini-3.5-flash-lite (default)" -ForegroundColor White
+            Write-Host "  [2] gemini-3.6-flash" -ForegroundColor White
             Write-Host ""
             $m = Read-Host "  Model [default: 1]"
-            $model = switch ($m) { "2" { "llama-3.1-8b-instant" } "3" { "openai/gpt-oss-120b" } "4" { "openai/gpt-oss-20b" } "5" { "meta-llama/llama-4-scout-17b-16e-instruct" } default { "llama-3.3-70b-versatile" } }
+            $model = switch ($m) { "2" { "gemini-3.6-flash" } default { "gemini-3.5-flash-lite" } }
         }
     }
 
