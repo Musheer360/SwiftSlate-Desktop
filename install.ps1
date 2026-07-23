@@ -1,14 +1,14 @@
 # SwiftSlate Desktop
 # https://github.com/Musheer360/SwiftSlate-Desktop
-# irm https://cdn.jsdelivr.net/gh/Musheer360/SwiftSlate-Desktop@master/install.ps1 | iex
+# irm https://raw.githubusercontent.com/Musheer360/SwiftSlate-Desktop/master/install.ps1 | iex
 
 $installDir = Join-Path $env:USERPROFILE ".swiftslate"
 $runtimeDir = Join-Path $installDir "runtime"
 $startupDir = [Environment]::GetFolderPath("Startup")
 $shortcutPath = Join-Path $startupDir "SwiftSlate Desktop.lnk"
 $isInstalled = Test-Path (Join-Path $installDir "SwiftSlate.pyw")
-$repo = "https://cdn.jsdelivr.net/gh/Musheer360/SwiftSlate-Desktop@master"
-$repoFallback = "https://raw.githubusercontent.com/Musheer360/SwiftSlate-Desktop/master"
+$repo = "https://raw.githubusercontent.com/Musheer360/SwiftSlate-Desktop/master"
+$repoFallback = "https://cdn.jsdelivr.net/gh/Musheer360/SwiftSlate-Desktop@master"
 $repoApi = "https://api.github.com/repos/Musheer360/SwiftSlate-Desktop/contents"
 
 # Ensure TLS 1.2+ (older Windows/PowerShell may default to TLS 1.0 which many CDNs reject)

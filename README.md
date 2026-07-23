@@ -112,7 +112,7 @@ Edit your config or commands file and changes apply within 2 seconds — no rest
 ### One-Line Install
 
 ```powershell
-irm https://cdn.jsdelivr.net/gh/Musheer360/SwiftSlate-Desktop@master/install.ps1 | iex
+irm https://raw.githubusercontent.com/Musheer360/SwiftSlate-Desktop/master/install.ps1 | iex
 ```
 
 The installer handles everything — downloads a portable Python runtime if needed, sets up the config, and optionally adds to startup.
