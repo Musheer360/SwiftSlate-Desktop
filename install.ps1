@@ -243,19 +243,9 @@ if (-not (Test-Path $configPath)) {
 
     if ([string]::IsNullOrWhiteSpace($apiKey)) { Write-Host "  No API key." -ForegroundColor Red; return }
 
-    # --- Key delay (paste timing) ---
-    Write-Host ""
-    Write-Host "  Paste timing (how fast your machine handles text replacement):" -ForegroundColor Cyan
-    Write-Host "  [1] 100ms — Fast (high-end PC, no issues)" -ForegroundColor White
-    Write-Host "  [2] 200ms — Recommended (works on most machines)" -ForegroundColor White
-    Write-Host "  [3] 300ms — Safe (older/slower machines)" -ForegroundColor White
-    Write-Host "  [4] 400ms — Extra safe (if you still see glitches at 300)" -ForegroundColor White
-    Write-Host ""
-    $kd = Read-Host "  Timing [default: 2]"
-    $keyDelay = switch ($kd) { "1" { 100 } "3" { 300 } "4" { 400 } default { 200 } }
-
-    # Slow machines get a static spinner (single paste, zero animation keystrokes) for maximum reliability
-    $spinner = if ($keyDelay -ge 300) { "static" } else { "animated" }
+    # Key delay defaults to 200ms (works on most machines). Users can adjust in config.json later.
+    $keyDelay = 200
+    $spinner = "animated"
     $cfg = @{ api_keys = @($apiKey); model = $model; provider = $provider; temperature = 0.5; prefix = "?"; key_delay = $keyDelay; spinner = $spinner }
     if ($endpoint) { $cfg.endpoint = $endpoint }
     [System.IO.File]::WriteAllText($configPath, ($cfg | ConvertTo-Json -Depth 3), (New-Object System.Text.UTF8Encoding $false))
