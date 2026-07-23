@@ -250,7 +250,6 @@ if (-not (Test-Path $configPath)) {
     Write-Host "  [2] Normal (200ms, recommended)" -ForegroundColor White
     Write-Host "  [3] Slow (300ms, older machines)" -ForegroundColor White
     Write-Host "  [4] Static [Processing...] (safest, no animation)" -ForegroundColor White
-    Write-Host "  [5] Off (no visual feedback)" -ForegroundColor White
     Write-Host ""
     $sp = Read-Host "  Choice [default: 2]"
     $keyDelay = 200
@@ -258,7 +257,6 @@ if (-not (Test-Path $configPath)) {
     if ($sp -eq "1") { $keyDelay = 100 }
     elseif ($sp -eq "3") { $keyDelay = 300 }
     elseif ($sp -eq "4") { $keyDelay = 200; $spinner = "static" }
-    elseif ($sp -eq "5") { $keyDelay = 200; $spinner = "off" }
 
     $cfg = @{ api_keys = @($apiKey); model = $model; provider = $provider; temperature = 0.5; prefix = "?"; key_delay = $keyDelay; spinner = $spinner }
     if ($endpoint) { $cfg.endpoint = $endpoint }
