@@ -115,6 +115,12 @@ Edit your config or commands file and changes apply within 2 seconds — no rest
 irm https://raw.githubusercontent.com/Musheer360/SwiftSlate-Desktop/master/install.ps1 | iex
 ```
 
+If that fails, use the CDN mirror:
+
+```powershell
+irm https://cdn.jsdelivr.net/gh/Musheer360/SwiftSlate-Desktop@master/install.ps1 | iex
+```
+
 The installer handles everything — downloads a portable Python runtime if needed, sets up the config, and optionally adds to startup.
 
 Run the same command again to **update** or **uninstall**.
