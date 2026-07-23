@@ -1165,7 +1165,7 @@ def do_transform(trigger_name, prompt):
         # widening the safety margin for the target app to process each
         # Shift+Left+char replace before the next one arrives. This is the key
         # to predictable behavior on slow machines or machines under load.
-        SPINNER_INTERVAL = max(0.3, key_delay * 1.5)
+        SPINNER_INTERVAL = max(0.2, key_delay * 1.0)
         frame = 0
         window_changed = False
         aborted = False
