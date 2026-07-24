@@ -68,7 +68,7 @@ $pythonZipUrl = "https://www.python.org/ftp/python/$pythonVersion/python-$python
 function Stop-SwiftSlate {
     Get-Process pythonw, python -ErrorAction SilentlyContinue | ForEach-Object {
         try { $cmd = (Get-CimInstance Win32_Process -Filter "ProcessId = $($_.Id)" -EA SilentlyContinue).CommandLine
-            if ($cmd -like "*SwiftSlate*") { Stop-Process -Id $_.Id -Force -EA SilentlyContinue }
+            if ($cmd -like "*SwiftSlate.pyw*") { Stop-Process -Id $_.Id -Force -EA SilentlyContinue }
         } catch {}
     }
     Start-Sleep -Milliseconds 500

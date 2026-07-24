@@ -228,15 +228,15 @@ def strip_markdown_fences(text):
 # GroqModels.kt and GeminiModels.kt). Each model specifies the extra params
 # it needs; sending wrong params returns HTTP 400.
 GROQ_MODEL_PARAMS = {
-    # GPT-OSS: cannot fully disable reasoning; minimize to "low" and hide from response
-    "openai/gpt-oss-120b": {"reasoning_effort": "low", "include_reasoning": False},
+    # GPT-OSS: cannot fully disable reasoning; "medium" balances quality and latency (~1.2s).
+    "openai/gpt-oss-120b": {"reasoning_effort": "medium", "include_reasoning": False},
     # Qwen 3.x: fully disable reasoning ("low"/"medium"/"high" return 400)
     "qwen/qwen3.6-27b": {"reasoning_effort": "none"},
 }
 GEMINI_MODEL_PARAMS = {
-    # "minimal" keeps latency low; without it, gemini-3.6-flash defaults to
-    # "medium" thinking (~4-5s per request)
-    "gemini-3.5-flash-lite": {"thinkingLevel": "minimal"},
+    # "low" on flash-lite = same latency as "minimal" but slightly better reasoning.
+    # "minimal" on 3.6-flash keeps latency ~1.3s (without it, defaults to "medium" = ~3s).
+    "gemini-3.5-flash-lite": {"thinkingLevel": "low"},
     "gemini-3.6-flash": {"thinkingLevel": "minimal"},
 }
 DEFAULT_GROQ_MODEL = "openai/gpt-oss-120b"
@@ -369,7 +369,7 @@ def _notify_debounced(message, icon=NIIF_INFO):
 # --- Load config ---
 def load_config():
     global config, commands, api_keys, model, prefix, translate_prefix
-    global trigger_strings, trigger_last_chars
+    global trigger_strings, trigger_last_chars, max_buffer_len
     global provider, temperature, custom_endpoint, key_delay, spinner_mode
 
     config_path = os.path.join(script_dir, "config.json")
@@ -398,26 +398,25 @@ def load_config():
         # A string here would be iterated character-by-character downstream
         log("ERROR: api_keys in config.json must be a list")
         api_keys = []
+    provider = config.get("provider", "gemini")
     default_model = DEFAULT_GEMINI_MODEL if provider == "gemini" else DEFAULT_GROQ_MODEL
     model = config.get("model", default_model)
     if not isinstance(model, str) or not model.strip():
         log(f"WARNING: Invalid model value, defaulting to {default_model}")
         model = default_model
     prefix = config.get("prefix", "?")
-    provider = config.get("provider", "gemini")
     temperature = config.get("temperature", 0.5)
     custom_endpoint = config.get("endpoint", "")
     if not isinstance(custom_endpoint, str):
         # A non-string endpoint would crash .startswith() validation below
         log("WARNING: Invalid endpoint value, ignoring")
         custom_endpoint = ""
-    translate_prefix = prefix + "translate:"
 
-    # Validate prefix
+    # Validate prefix (must happen before translate_prefix is computed)
     if not isinstance(prefix, str) or not prefix:
         log("WARNING: Invalid prefix, defaulting to '?'")
         prefix = "?"
-        translate_prefix = prefix + "translate:"
+    translate_prefix = prefix + "translate:"
 
     # Validate temperature
     if not isinstance(temperature, (int, float)):
@@ -525,6 +524,11 @@ def load_config():
     commands = new_commands
     trigger_strings = new_trigger_strings
     trigger_last_chars = new_trigger_last_chars
+    # Buffer only needs to hold the longest trigger (+ margin for translate:XXXXX).
+    # Smaller buffer = less sensitive typed data held in memory at any time.
+    longest_trigger = max((len(f) for f in new_trigger_strings.values()), default=20)
+    translate_len = len(translate_prefix) + 5  # ?translate:XXXXX
+    max_buffer_len = max(longest_trigger, translate_len) + 5
 
     log(f"Config loaded: model={model}, prefix={prefix}, keys={len(api_keys)}, key_delay={key_delay_ms}ms")
     log(f"Commands loaded: {len(commands)}")
@@ -698,6 +702,15 @@ def call_api(text, prompt):
             last_error = e
             log(f"Attempt {attempt+1}/{max_attempts}: HTTP {e.code} ({err_type})")
 
+            # Graceful degradation: if a 400/422 may be caused by thinking/reasoning
+            # params (e.g. API changed valid values), retry once without them. Mirrors
+            # Android's tuning-degradation logic.
+            if e.code in (400, 422) and err_type == ERR_OTHER:
+                degraded_result = _call_degraded(text, system_content, key)
+                if degraded_result is not None:
+                    log("Degraded retry (without tuning params) succeeded")
+                    return degraded_result, None
+
             if err_type == ERR_RATE_LIMIT:
                 # Try to extract Retry-After header
                 retry_after = 60
@@ -795,7 +808,7 @@ def _call_gemini(text, system_content, key):
     }, method="POST")
 
     # Let exceptions propagate to call_api retry loop
-    with urllib.request.urlopen(req, timeout=20) as resp:
+    with urllib.request.urlopen(req, timeout=45) as resp:
         data = json.loads(resp.read().decode("utf-8"))
         candidates = data.get("candidates", [])
         if candidates:
@@ -835,7 +848,7 @@ def _call_openai_compatible(text, system_content, key, endpoint):
     }, method="POST")
 
     # Let exceptions propagate to call_api retry loop
-    with urllib.request.urlopen(req, timeout=20) as resp:
+    with urllib.request.urlopen(req, timeout=45) as resp:
         data = json.loads(resp.read().decode("utf-8"))
         try:
             result = data["choices"][0]["message"]["content"].strip()
@@ -843,6 +856,64 @@ def _call_openai_compatible(text, system_content, key, endpoint):
         except (KeyError, IndexError, TypeError):
             log(f"Malformed API response: {list(data.keys())}")
             return None
+
+def _call_degraded(text, system_content, key):
+    """Retry without thinking/reasoning params on 400/422. Mirrors Android's
+    graceful degradation: working-but-unoptimized beats a hard failure."""
+    try:
+        if provider == "gemini":
+            safe_model = urllib.parse.quote(model, safe="")
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{safe_model}:generateContent"
+            safety_settings = []
+            for cat in ("HARM_CATEGORY_HARASSMENT", "HARM_CATEGORY_HATE_SPEECH",
+                        "HARM_CATEGORY_SEXUALLY_EXPLICIT", "HARM_CATEGORY_DANGEROUS_CONTENT",
+                        "HARM_CATEGORY_CIVIC_INTEGRITY"):
+                safety_settings.append({"category": cat, "threshold": "BLOCK_NONE"})
+            body = json.dumps({
+                "systemInstruction": {"parts": [{"text": system_content}]},
+                "contents": [{"parts": [{"text": wrap_user_text(text)}]}],
+                "safetySettings": safety_settings,
+                "generationConfig": {"temperature": temperature}  # No thinkingConfig
+            }).encode("utf-8")
+            req = urllib.request.Request(url, data=body, headers={
+                "Content-Type": "application/json",
+                "x-goog-api-key": key,
+                "User-Agent": "SwiftSlate/1.0",
+            }, method="POST")
+            with urllib.request.urlopen(req, timeout=45) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                candidates = data.get("candidates", [])
+                if candidates:
+                    parts = candidates[0].get("content", {}).get("parts", [])
+                    if parts:
+                        return strip_markdown_fences(parts[0].get("text", "").strip())
+        else:
+            endpoint = custom_endpoint if provider == "custom" else "https://api.groq.com/openai/v1"
+            url = f"{endpoint.rstrip('/')}/chat/completions"
+            # Vanilla request — no reasoning_effort, no include_reasoning
+            request_body = {
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system_content},
+                    {"role": "user", "content": wrap_user_text(text)}
+                ],
+                "temperature": temperature
+            }
+            body = json.dumps(request_body).encode("utf-8")
+            req = urllib.request.Request(url, data=body, headers={
+                "Authorization": f"Bearer {key}",
+                "Content-Type": "application/json",
+                "User-Agent": "SwiftSlate/1.0",
+            }, method="POST")
+            with urllib.request.urlopen(req, timeout=45) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                try:
+                    return strip_markdown_fences(data["choices"][0]["message"]["content"].strip())
+                except (KeyError, IndexError, TypeError):
+                    pass
+    except Exception as e:
+        log(f"Degraded retry also failed: {e}")
+    return None
 
 # --- Clipboard (silent, no history pollution) ---
 def set_clipboard_silent(text):
@@ -934,6 +1005,7 @@ KEYEVENTF_UNICODE = 0x0004
 VK_CONTROL = 0x11
 VK_SHIFT = 0x10
 VK_LEFT = 0x25
+VK_RIGHT = 0x27
 _KEY_MAP = {"a": 0x41, "c": 0x43, "v": 0x56}
 
 # Magic value to tag self-generated keystrokes (so Raw Input hook ignores them)
@@ -1067,6 +1139,13 @@ def grab_field_text():
         if attached:
             user32.AttachThreadInput(our_tid, fg_tid, False)
 
+    # Timed out waiting for clipboard — deselect to prevent data loss if user types next
+    if user32.GetForegroundWindow() == fg:
+        inputs_deselect = (INPUT * 2)(
+            _make_key(VK_RIGHT),
+            _make_key(VK_RIGHT, KEYEVENTF_KEYUP),
+        )
+        user32.SendInput(2, ctypes.byref(inputs_deselect), ctypes.sizeof(INPUT))
     return None, prev
 
 # --- Paste text into active field ---
@@ -1105,6 +1184,9 @@ def paste_text(text):
 def _retry_paste(text, max_retries=5):
     """Attempt to paste text, retrying if clipboard is locked."""
     for i in range(max_retries):
+        if abort_event.is_set():
+            log("Paste retry aborted — user is typing")
+            return False
         if paste_text(text):
             return True
         log(f"Retry paste attempt {i+1}/{max_retries} failed")
@@ -1120,12 +1202,17 @@ def do_transform(trigger_name, prompt):
     hwnd = user32.GetForegroundWindow()
     trigger_full = prefix + trigger_name
     prev_clip = None
+    clip_seq_at_grab = user32.GetClipboardSequenceNumber()
 
     try:
         full_text, prev_clip = grab_field_text()
         if not full_text or not full_text.strip():
             log("No text captured")
             return
+
+        # Record clipboard sequence at grab time — only restore prev_clip if
+        # nobody else has written to the clipboard since then.
+        clip_seq_at_grab = user32.GetClipboardSequenceNumber()
 
         # Strip trigger (case-insensitive for translate:XX)
         input_text = full_text
@@ -1308,10 +1395,19 @@ def do_transform(trigger_name, prompt):
             # Don't restore prev_clip — leave result available
             prev_clip = None
     finally:
-        # Always restore clipboard and release processing
+        # Only restore prev_clip if clipboard hasn't been modified by an external
+        # app since we grabbed it. Our own operations (spinner paste, result paste)
+        # bump the sequence — but those paths already set prev_clip = None.
+        # This guard catches the case where prev_clip is still set (e.g., API failed
+        # and we restored original) but the user manually copied something during the wait.
         time.sleep(0.2)
         if prev_clip is not None:
-            set_clipboard_silent(prev_clip)
+            current_seq = user32.GetClipboardSequenceNumber()
+            # Allow up to 4 sequence bumps from our own operations (clear + spinner + result + restore)
+            if (current_seq - clip_seq_at_grab) <= 4:
+                set_clipboard_silent(prev_clip)
+            else:
+                log("Clipboard changed externally — skipping restoration")
         processing = False
         log("--- Done ---")
 
@@ -1412,8 +1508,12 @@ def do_replacer(trigger_name, cmd_type, value):
                 log(f"Shell command failed: {e}")
 
         if replacement:
-            paste_text(before + replacement)
-            log(f"Replaced with: {len(replacement)} chars")
+            if abort_event.is_set():
+                log("Replacer: user typed during execution, skipping paste")
+                paste_text(before.rstrip() if before else (full_text or ""))
+            else:
+                paste_text(before + replacement)
+                log(f"Replaced with: {len(replacement)} chars")
         else:
             # Failure - restore text without trigger
             paste_text(before.rstrip() if before else (full_text or ""))
