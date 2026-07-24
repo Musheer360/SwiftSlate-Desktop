@@ -210,11 +210,12 @@ if (-not (Test-Path $configPath)) {
             Write-Host ""
             $apiKey = Read-Host "  API Key"
             Write-Host ""
-            Write-Host "  [1] openai/gpt-oss-120b (default)" -ForegroundColor White
-            Write-Host "  [2] qwen/qwen3.6-27b" -ForegroundColor White
+            Write-Host "  [1] openai/gpt-oss-120b (Balanced, default)" -ForegroundColor White
+            Write-Host "  [2] openai/gpt-oss-120b-quality (Quality, slower)" -ForegroundColor White
+            Write-Host "  [3] qwen/qwen3.6-27b (Fast)" -ForegroundColor White
             Write-Host ""
             $m = Read-Host "  Model [default: 1]"
-            $model = switch ($m) { "2" { "qwen/qwen3.6-27b" } default { "openai/gpt-oss-120b" } }
+            $model = switch ($m) { "2" { "openai/gpt-oss-120b-quality" } "3" { "qwen/qwen3.6-27b" } default { "openai/gpt-oss-120b" } }
         }
         "3" {
             $provider = "custom"
