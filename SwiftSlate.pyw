@@ -228,18 +228,12 @@ def strip_markdown_fences(text):
 # GroqModels.kt and GeminiModels.kt). Each model specifies the extra params
 # it needs; sending wrong params returns HTTP 400.
 GROQ_MODEL_PARAMS = {
-    # GPT-OSS 120B at two reasoning levels:
-    # - "medium" (Balanced): good for most commands. ~1s latency.
-    # - "high" (Quality): perfect prompt adherence + better creative output. ~2-3s.
-    # "low" removed: unreliable system-prompt adherence on ambiguous inputs.
-    "openai/gpt-oss-120b": {"reasoning_effort": "medium", "include_reasoning": False},
-    "openai/gpt-oss-120b-quality": {"reasoning_effort": "high", "include_reasoning": False},
+    # GPT-OSS: cannot fully disable reasoning; "medium" balances quality and latency (~1s).
+    # max_completion_tokens=16384 prevents json_validate_failed when reasoning tokens
+    # exhaust Groq's default 3072 cap (especially with json_object mode enabled).
+    "openai/gpt-oss-120b": {"reasoning_effort": "medium", "include_reasoning": False, "max_completion_tokens": 16384},
     # Qwen 3.x: fully disable reasoning ("low"/"medium"/"high" return 400)
     "qwen/qwen3.6-27b": {"reasoning_effort": "none"},
-}
-# Virtual model IDs → actual API model ID. Entries not listed here use their ID as-is.
-GROQ_API_MODEL_MAP = {
-    "openai/gpt-oss-120b-quality": "openai/gpt-oss-120b",
 }
 GEMINI_MODEL_PARAMS = {
     # "low" on flash-lite = same latency as "minimal" but slightly better reasoning.
@@ -831,10 +825,8 @@ def _call_openai_compatible(text, system_content, key, endpoint):
     Mirrors Android's OpenAICompatibleClient: <input> fencing, per-model reasoning params."""
     url = f"{endpoint.rstrip('/')}/chat/completions"
 
-    # Resolve virtual model ID → actual API model ID
-    api_model = GROQ_API_MODEL_MAP.get(model, model)
     request_body = {
-        "model": api_model,
+        "model": model,
         "messages": [
             {"role": "system", "content": system_content},
             {"role": "user", "content": wrap_user_text(text)}
@@ -901,9 +893,8 @@ def _call_degraded(text, system_content, key):
             endpoint = custom_endpoint if provider == "custom" else "https://api.groq.com/openai/v1"
             url = f"{endpoint.rstrip('/')}/chat/completions"
             # Vanilla request — no reasoning_effort, no include_reasoning
-            api_model = GROQ_API_MODEL_MAP.get(model, model)
             request_body = {
-                "model": api_model,
+                "model": model,
                 "messages": [
                     {"role": "system", "content": system_content},
                     {"role": "user", "content": wrap_user_text(text)}
