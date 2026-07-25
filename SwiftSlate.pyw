@@ -404,6 +404,13 @@ def load_config():
         log("ERROR: api_keys in config.json must be a list")
         api_keys = []
     provider = config.get("provider", "gemini")
+    # Membership must be checked BEFORE default_model is derived from it: a typo'd or
+    # differently-cased provider ("Gemini", "gemeni") otherwise falls through to the
+    # Groq default model while provider is later coerced to gemini, so every request
+    # sends a Groq model id to Gemini and fails.
+    if provider not in ("groq", "gemini", "custom"):
+        log(f"WARNING: Unknown provider '{provider}', defaulting to gemini")
+        provider = "gemini"
     default_model = DEFAULT_GEMINI_MODEL if provider == "gemini" else DEFAULT_GROQ_MODEL
     model = config.get("model", default_model)
     if not isinstance(model, str) or not model.strip():
@@ -452,10 +459,6 @@ def load_config():
     # Filter out empty keys
     api_keys = [k for k in api_keys if isinstance(k, str) and k.strip()]
 
-    if provider not in ("groq", "gemini", "custom"):
-        log(f"WARNING: Unknown provider '{provider}', defaulting to gemini")
-        provider = "gemini"
-
     if provider == "custom" and not custom_endpoint:
         log("WARNING: Custom provider but no endpoint set, defaulting to gemini")
         notify("SwiftSlate", "Custom provider set but no endpoint configured.", NIIF_WARNING)
@@ -472,6 +475,22 @@ def load_config():
         if host not in ("localhost", "127.0.0.1", "::1"):
             log("WARNING: Custom endpoint uses plaintext HTTP - API key sent unencrypted")
             notify("SwiftSlate", "Endpoint uses HTTP, not HTTPS. API key is sent unencrypted.", NIIF_WARNING)
+
+    # Coerce the model to one the ACTIVE provider actually offers. Mirrors Android's
+    # GroqModels.sanitize()/GeminiModels.sanitize(), whose stated job is migrating users
+    # off retired model ids. Must run after the provider fallbacks above, since those can
+    # change which catalog applies. Without this, a config left pointing at a removed
+    # model — or at the other provider's model after editing "provider" by hand — sends
+    # an unknown id on every request and every transform fails with an opaque API error.
+    # Custom endpoints are exempt: their model names are user-defined by design.
+    if provider == "groq" and model not in GROQ_MODEL_PARAMS:
+        log(f"WARNING: Unknown Groq model '{model}', falling back to {DEFAULT_GROQ_MODEL}")
+        notify("SwiftSlate", f"Unknown model '{model}' - using {DEFAULT_GROQ_MODEL}.", NIIF_WARNING)
+        model = DEFAULT_GROQ_MODEL
+    elif provider == "gemini" and model not in GEMINI_MODEL_PARAMS:
+        log(f"WARNING: Unknown Gemini model '{model}', falling back to {DEFAULT_GEMINI_MODEL}")
+        notify("SwiftSlate", f"Unknown model '{model}' - using {DEFAULT_GEMINI_MODEL}.", NIIF_WARNING)
+        model = DEFAULT_GEMINI_MODEL
 
     # Load commands into FRESH containers, then atomically swap the global
     # references at the end. The message-loop thread iterates these dicts on
@@ -580,10 +599,15 @@ def _start_file_watcher():
                     if load_config():
                         _config_mtime = ct
                         _commands_mtime = cm
-                        # Only reset key tracking if the actual keys changed
+                        # Invalid-key marks are permanent for the process lifetime, so a
+                        # config fix must clear them — otherwise selecting a model the keys
+                        # can't access (403 on every key) wedges the app on "All API keys
+                        # rejected" even after the model is corrected, until restart.
+                        # Rate-limit cooldowns are time-based and self-heal, so those only
+                        # reset when the key set itself changed.
+                        _invalid_keys.clear()
                         if set(api_keys) != set(old_keys):
                             _rate_limited_keys.clear()
-                            _invalid_keys.clear()
                         log("Hot reload: config/commands reloaded")
                         _notify_debounced("Config reloaded.", NIIF_INFO)
                     else:
@@ -647,8 +671,11 @@ def classify_error(e, http_code=None):
         return ERR_INVALID_KEY
     if http_code is not None and 500 <= http_code <= 599:
         return ERR_SERVER
-    if isinstance(e, (urllib.error.URLError, TimeoutError, OSError)):
-        return ERR_NETWORK
+    # HTTPError MUST be tested before URLError/OSError: HTTPError subclasses both, so
+    # the broader isinstance() below would classify every HTTP status as a network
+    # error. That made ERR_OTHER unreachable for HTTP failures, which in turn meant
+    # the 400/422 graceful-degradation retry in call_api() could never fire and
+    # _call_degraded() was dead code.
     if isinstance(e, urllib.error.HTTPError):
         if e.code == 429:
             return ERR_RATE_LIMIT
@@ -656,6 +683,9 @@ def classify_error(e, http_code=None):
             return ERR_INVALID_KEY
         if 500 <= e.code <= 599:
             return ERR_SERVER
+        return ERR_OTHER
+    if isinstance(e, (urllib.error.URLError, TimeoutError, OSError)):
+        return ERR_NETWORK
     return ERR_OTHER
 
 # --- API call with retry ---
@@ -706,6 +736,15 @@ def call_api(text, prompt):
             err_type = classify_error(e, e.code)
             last_error = e
             log(f"Attempt {attempt+1}/{max_attempts}: HTTP {e.code} ({err_type})")
+
+            # 413 = the request exceeds this key's per-minute token budget. Groq
+            # enforces TPM per organization, so a different key (different org) may
+            # still have headroom — rotate instead of hard-failing. Short cooldown
+            # because the budget refills every minute.
+            if e.code == 413:
+                log("Request too large for this key's token budget — trying next key")
+                report_rate_limit(key, 10)
+                continue
 
             # Graceful degradation: if a 400/422 may be caused by thinking/reasoning
             # params (e.g. API changed valid values), retry once without them. Mirrors
@@ -819,7 +858,7 @@ def _call_gemini(text, system_content, key):
         if candidates:
             parts = candidates[0].get("content", {}).get("parts", [])
             if parts:
-                result = parts[0].get("text", "").strip()
+                result = (parts[0].get("text") or "").strip()
                 return strip_markdown_fences(result)
     return None
 
@@ -856,9 +895,13 @@ def _call_openai_compatible(text, system_content, key, endpoint):
     with urllib.request.urlopen(req, timeout=45) as resp:
         data = json.loads(resp.read().decode("utf-8"))
         try:
-            result = data["choices"][0]["message"]["content"].strip()
+            # Some OpenAI-compatible providers return "content": null (notably when a
+            # content filter fires). None.strip() raises AttributeError, which was not
+            # in the except tuple and escaped as an unhandled "Unexpected error".
+            content = data["choices"][0]["message"].get("content")
+            result = (content or "").strip()
             return strip_markdown_fences(result)
-        except (KeyError, IndexError, TypeError):
+        except (KeyError, IndexError, TypeError, AttributeError):
             log(f"Malformed API response: {list(data.keys())}")
             return None
 
@@ -891,7 +934,7 @@ def _call_degraded(text, system_content, key):
                 if candidates:
                     parts = candidates[0].get("content", {}).get("parts", [])
                     if parts:
-                        return strip_markdown_fences(parts[0].get("text", "").strip())
+                        return strip_markdown_fences((parts[0].get("text") or "").strip())
         else:
             endpoint = custom_endpoint if provider == "custom" else "https://api.groq.com/openai/v1"
             url = f"{endpoint.rstrip('/')}/chat/completions"
@@ -1493,9 +1536,20 @@ def do_replacer(trigger_name, cmd_type, value):
             log("No text captured")
             return
 
-        before = ""
-        if full_text.endswith(trigger_full):
-            before = full_text[:-len(trigger_full)]
+        # The trigger must be at the end of the captured text. grab_field_text() does a
+        # select-all, so full_text is the WHOLE field — without this guard a trigger that
+        # isn't the last thing in a multi-line field left `before` empty and the paste
+        # below replaced the entire field with just the replacement (unrecoverable:
+        # do_replacer never records undo state).
+        # grab_field_text() leaves the field itself untouched, so the safe action is to
+        # do nothing but put the user's clipboard back.
+        if not full_text.endswith(trigger_full):
+            log("Replacer: trigger not at end of field, leaving text unchanged")
+            if prev_clip:
+                set_clipboard_silent(prev_clip)
+            return
+
+        before = full_text[:-len(trigger_full)]
 
         replacement = ""
         if cmd_type == "replacer-text":
