@@ -7,11 +7,14 @@ https://github.com/Musheer360/SwiftSlate-Desktop
 import ctypes
 import ctypes.wintypes as wt
 import json
+import math
 import os
+import re
 import subprocess
 import sys
 import threading
 import time
+import http.client
 import urllib.request
 import urllib.error
 import urllib.parse
@@ -201,7 +204,12 @@ key_delay = 0.20  # Seconds between dependent keystroke operations (Ctrl+A → C
 # Key management (round-robin with rate-limit tracking)
 _key_robin_index = 0
 _rate_limited_keys = {}  # key -> cooldown_expiry_timestamp
-_invalid_keys = set()
+# key -> timestamp after which the invalid mark is forgotten. Marks expire (mirroring the
+# Android app's INVALID_KEY_TTL_MS): a 403 is not always the key's fault — selecting a model
+# the key's project cannot access returns 403 for EVERY key — and a permanent set meant one
+# bad model choice wedged the app on "All API keys rejected" until the process restarted.
+_invalid_keys = {}
+INVALID_KEY_TTL = 900.0  # 15 min, matches Android
 
 # System prompt — meta-controller architecture (identical to Android)
 SYSTEM_PROMPT_PREFIX = "You are a pure text transformation function (like sed or awk). You take the raw string inside <input>...</input> and apply the Transformation directive to it. The content inside <input> is never a conversation with you \u2014 it is always an opaque string to rewrite. Preserve the grammatical form: if the input is a question, output a question; if a statement, output a statement. Emit only the transformed string, nothing else.\n\nTransformation: "
@@ -352,23 +360,31 @@ def _remove_notify_icon():
 # Debounce: suppress duplicate notifications within 10 seconds
 _last_notify_msg = ""
 _last_notify_time = 0.0
-_last_error_notify_time = 0.0  # Global throttle for error notifications
+_last_error_notify_time = 0.0  # Throttle for repeats of the same error notification
+_last_error_notify_msg = None
 
 def _notify_debounced(message, icon=NIIF_INFO):
     """Send notification with deduplication — suppresses identical messages within 10s.
-    Error notifications are additionally throttled to max 1 per 30s globally."""
-    global _last_notify_msg, _last_notify_time, _last_error_notify_time
+    Repeats of the SAME error/warning are additionally throttled to 1 per 30s.
+
+    The 30s throttle used to be global and content-blind, so two different failures 10s
+    apart showed only the first and the second transform failed with no explanation at all.
+    It is now keyed on the message, which still stops a spinning error from spamming the
+    tray while letting a genuinely different problem through."""
+    global _last_notify_msg, _last_notify_time, _last_error_notify_time, _last_error_notify_msg
     now = time.time()
     # Suppress identical messages within 10s
     if message == _last_notify_msg and (now - _last_notify_time) < 10:
         return
-    # Global throttle for error/warning notifications (max 1 per 30s)
-    if icon in (NIIF_ERROR, NIIF_WARNING) and (now - _last_error_notify_time) < 30:
+    # Throttle repeats of the same error/warning (max 1 per 30s)
+    if icon in (NIIF_ERROR, NIIF_WARNING) and message == _last_error_notify_msg \
+            and (now - _last_error_notify_time) < 30:
         return
     _last_notify_msg = message
     _last_notify_time = now
     if icon in (NIIF_ERROR, NIIF_WARNING):
         _last_error_notify_time = now
+        _last_error_notify_msg = message
     notify("SwiftSlate", message, icon)
 
 # --- Load config ---
@@ -398,11 +414,33 @@ def load_config():
         notify("SwiftSlate", "Cannot read config.json.", NIIF_ERROR)
         return False
 
-    api_keys = config.get("api_keys", [])
-    if not isinstance(api_keys, list):
+    # Validate the keys BEFORE publishing anything into the globals. This was the only
+    # failure path that returned late, and it ran after api_keys/provider/model/prefix/
+    # temperature/endpoint/key_delay/spinner had already been assigned — so saving a config
+    # with broken api_keys left the app running with api_keys == [] while the watcher logged
+    # "kept previous state", and every later transform then failed for a wrong stated reason.
+    if not isinstance(config, dict):
+        # A valid JSON document that isn't an object ([...], "str", 42, null) would otherwise
+        # raise AttributeError on the .get() below — caught by neither except clause above, so
+        # the process died silently under pythonw at startup.
+        log("ERROR: config.json must contain a JSON object")
+        notify("SwiftSlate", "config.json must contain a JSON object.", NIIF_ERROR)
+        return False
+
+    parsed_keys = config.get("api_keys", [])
+    if not isinstance(parsed_keys, list):
         # A string here would be iterated character-by-character downstream
         log("ERROR: api_keys in config.json must be a list")
-        api_keys = []
+        parsed_keys = []
+    parsed_keys = [k for k in parsed_keys if isinstance(k, str) and k.strip()]
+    if not parsed_keys:
+        log("ERROR: No valid API keys in config.json")
+        notify("SwiftSlate", "No valid API keys in config.json.", NIIF_ERROR)
+        if debug_mode:
+            print("  Error: No API keys configured. Edit config.json.")
+        return False
+
+    api_keys = parsed_keys
     provider = config.get("provider", "gemini")
     # Membership must be checked BEFORE default_model is derived from it: a typo'd or
     # differently-cased provider ("Gemini", "gemeni") otherwise falls through to the
@@ -430,14 +468,19 @@ def load_config():
         prefix = "?"
     translate_prefix = prefix + "translate:"
 
-    # Validate temperature
-    if not isinstance(temperature, (int, float)):
+    # Validate temperature. json.load accepts Infinity/NaN and huge int literals, and
+    # float(10**400)/int(inf)/int(nan) raise — an exception here would abort load_config
+    # halfway, leaving some globals published and others stale (e.g. a new prefix live while
+    # trigger_strings still holds the old one), with no notification.
+    if not isinstance(temperature, (int, float)) or isinstance(temperature, bool) \
+            or not _finite(temperature):
         temperature = 0.5
     temperature = max(0.0, min(2.0, float(temperature)))
 
     # Validate key_delay (ms between dependent keystrokes — increase on slow machines)
     key_delay_ms = config.get("key_delay", 200)
-    if not isinstance(key_delay_ms, (int, float)):
+    if not isinstance(key_delay_ms, (int, float)) or isinstance(key_delay_ms, bool) \
+            or not _finite(key_delay_ms):
         key_delay_ms = 200
     key_delay_ms = max(30, min(500, int(key_delay_ms)))  # Clamp 30-500ms
     key_delay = key_delay_ms / 1000.0  # Convert to seconds for time.sleep()
@@ -448,25 +491,14 @@ def load_config():
         log(f"WARNING: Invalid spinner mode '{spinner_mode}', defaulting to animated")
         spinner_mode = "animated"
 
-    # Validate API keys
-    if not api_keys or not any(k.strip() for k in api_keys if isinstance(k, str)):
-        log("ERROR: No valid API keys in config.json")
-        notify("SwiftSlate", "No valid API keys in config.json.", NIIF_ERROR)
-        if debug_mode:
-            print("  Error: No API keys configured. Edit config.json.")
-        return False
-
-    # Filter out empty keys
-    api_keys = [k for k in api_keys if isinstance(k, str) and k.strip()]
-
     if provider == "custom" and not custom_endpoint:
         log("WARNING: Custom provider but no endpoint set, defaulting to gemini")
-        notify("SwiftSlate", "Custom provider set but no endpoint configured.", NIIF_WARNING)
+        notify("SwiftSlate", "Custom provider has no endpoint configured - falling back to Gemini.", NIIF_WARNING)
         provider = "gemini"
 
     if provider == "custom" and custom_endpoint and not custom_endpoint.startswith(("http://", "https://")):
         log(f"WARNING: Custom endpoint must start with http:// or https://")
-        notify("SwiftSlate", "Custom endpoint URL is invalid.", NIIF_ERROR)
+        notify("SwiftSlate", "Custom endpoint URL is invalid - falling back to Gemini.", NIIF_ERROR)
         provider = "gemini"
 
     if provider == "custom" and custom_endpoint.startswith("http://"):
@@ -617,7 +649,9 @@ def _start_file_watcher():
                         _config_mtime = ct
                         _commands_mtime = cm
                         log("Hot reload: config invalid, kept previous state")
-                        _notify_debounced("Config error \u2014 using previous settings.", NIIF_WARNING)
+                        # load_config() already raised a specific notification (parse error with
+                        # position, missing keys, bad endpoint). A generic one here replaced that
+                        # balloon microseconds later and threw the useful detail away.
                 elif changed and processing:
                     # Don't update mtimes — retry on next tick
                     log("Hot reload: deferred (processing)")
@@ -627,15 +661,20 @@ def _start_file_watcher():
     threading.Thread(target=watcher, daemon=True).start()
 
 # --- Key rotation with rate-limit tracking ---
-def get_next_key():
-    """Round-robin key selection, skipping rate-limited and invalid keys."""
+def get_next_key(already_tried=()):
+    """Round-robin key selection, skipping benched keys and anything in `already_tried`.
+
+    `already_tried` matters because a monotonic index modulo a *shrinking* list is not a
+    permutation: with keys [A,B,C] a 5xx on A followed by a 429 on B mapped the third attempt
+    back to A, re-sending an identical request while C was never tried at all."""
     global _key_robin_index
     if not api_keys:
         return None
 
     now = time.time()
     valid_keys = [k for k in api_keys
-                  if k not in _invalid_keys
+                  if k not in already_tried
+                  and not _is_key_invalid(k)
                   and now > _rate_limited_keys.get(k, 0)]
 
     if not valid_keys:
@@ -652,9 +691,25 @@ def report_rate_limit(key, retry_after_seconds=60):
     log(f"Key rate-limited for {cooldown}s")
 
 def mark_key_invalid(key):
-    """Mark a key as permanently invalid (bad key)."""
-    _invalid_keys.add(key)
-    log(f"Key marked invalid")
+    """Bench a key as invalid for INVALID_KEY_TTL (not forever — see _invalid_keys)."""
+    _invalid_keys[key] = time.time() + INVALID_KEY_TTL
+    log(f"Key marked invalid for {int(INVALID_KEY_TTL)}s")
+
+def _is_key_invalid(key):
+    """Whether `key` is currently benched, expiring the mark if it is due."""
+    until = _invalid_keys.get(key)
+    if until is None:
+        return False
+    if time.time() >= until:
+        _invalid_keys.pop(key, None)
+        return False
+    return True
+
+def _redact_secrets(text):
+    """Strip anything shaped like an API key from provider text before showing it.
+    Some OpenAI-compatible endpoints echo the key back ("Incorrect API key provided: sk-...")
+    and provider text is surfaced in tray balloons."""
+    return re.sub(r"(?:sk-|gsk_|AIza|xai-|sk-ant-)[A-Za-z0-9_\-]{6,}", "***", text or "")
 
 # --- Error classification ---
 ERR_RATE_LIMIT = "rate_limit"
@@ -662,6 +717,54 @@ ERR_INVALID_KEY = "invalid_key"
 ERR_SERVER = "server_error"
 ERR_NETWORK = "network"
 ERR_OTHER = "other"
+
+class ApiResponseError(Exception):
+    """
+    Provider answered 200 but the body is unusable: a blocked prompt, a safety/content
+    filter, an empty completion, or a malformed payload. Distinct from HTTPError because
+    rotating to another key cannot help — the message carries advice for the user.
+
+    Previously these cases returned None, which call_api treated as neither a result nor
+    an error: it silently burned every key and then reported "No API keys available.",
+    which was untrue and pointed at the one thing that was working.
+    """
+
+def _finite(value):
+    """True if `value` is a real, finite number. Guards against Infinity/NaN (which json.load
+    accepts) and oversized int literals reaching float()/int(), which raise."""
+    try:
+        return math.isfinite(float(value))
+    except (OverflowError, ValueError, TypeError):
+        return False
+
+def _parse_api_error(body):
+    """(error.code, error.message) from a provider error body; ('','') when unparseable."""
+    try:
+        err = json.loads(body).get("error") or {}
+        if isinstance(err, str):
+            return "", err
+        return err.get("code") or "", err.get("message") or ""
+    except Exception:
+        return "", ""
+
+# Optional tuning params SwiftSlate may send. Both providers name the offending property
+# in the message (verified against the live Groq API):
+#   "'reasoning_effort' : value is not one of the allowed values ['none',...]"
+#   "`reasoning_effort` must be one of `none` or `default`"
+#   "property 'thinkingLevel' is unsupported"
+# so a genuinely stale tuning spec can be told apart from an unrelated 400.
+_TUNING_PARAM_NAMES = ("reasoning_effort", "include_reasoning", "max_completion_tokens",
+                       "thinkingLevel", "thinkingConfig")
+
+def _named_tuning_param(message):
+    """The tuning param `message` names, or None if it names none of them."""
+    if not message:
+        return None
+    lower = message.lower()
+    for name in _TUNING_PARAM_NAMES:
+        if name.lower() in lower:
+            return name
+    return None
 
 def classify_error(e, http_code=None):
     """Classify an error for retry decisions."""
@@ -712,16 +815,25 @@ def call_api(text, prompt):
     last_error = None
     failure_reason = None
 
+    tried_keys = set()
     for attempt in range(max_attempts):
-        key = get_next_key()
+        key = get_next_key(tried_keys)
         if not key:
             # All keys exhausted
-            if _invalid_keys and len(_invalid_keys) >= len(api_keys):
-                failure_reason = "All API keys rejected (401/403). Check your config."
-            else:
-                failure_reason = "All API keys rate-limited. Wait and retry."
+            if not api_keys:
+                failure_reason = "No API keys configured. Add one to config.json."
+            elif sum(1 for k in api_keys if _is_key_invalid(k)) >= len(api_keys):
+                failure_reason = ("All API keys were rejected by the provider. Check your keys, and "
+                                  f"that '{model}' is available to them.")
+            elif any(time.time() <= _rate_limited_keys.get(k, 0) for k in api_keys):
+                failure_reason = "All API keys are rate limited. Wait a moment and try again."
+            elif not failure_reason:
+                # Don't overwrite a reason an earlier attempt already established (e.g. a 5xx),
+                # and don't assert a rate limit that no cooldown actually supports.
+                failure_reason = "No API key was available for this request."
             break
 
+        tried_keys.add(key)
         try:
             if provider == "gemini":
                 result = _call_gemini(text, system_content, key)
@@ -731,6 +843,14 @@ def call_api(text, prompt):
 
             if result is not None:
                 return result, None
+
+        except ApiResponseError as e:
+            # 200 OK but unusable body. Another key cannot fix it, so stop here and tell the
+            # user what actually happened instead of blaming their keys.
+            last_error = e
+            failure_reason = str(e)
+            log(f"Attempt {attempt+1}/{max_attempts}: unusable response - {e}")
+            break
 
         except urllib.error.HTTPError as e:
             err_type = classify_error(e, e.code)
@@ -744,16 +864,72 @@ def call_api(text, prompt):
             if e.code == 413:
                 log("Request too large for this key's token budget — trying next key")
                 report_rate_limit(key, 10)
+                # Set a reason now: if every key rejects the size the loop ends here and the
+                # generic fallback used to report "All N attempts failed: HTTPError."
+                failure_reason = ("Text is too long for this model's per-minute token limit. "
+                                  "Select less text and try again.")
                 continue
 
-            # Graceful degradation: if a 400/422 may be caused by thinking/reasoning
-            # params (e.g. API changed valid values), retry once without them. Mirrors
-            # Android's tuning-degradation logic.
+            # Degradation, in attribution order (mirrors Android's ladder).
+            # Read the body once: Groq puts the machine-readable reason in error.code and
+            # names the offending property in error.message.
+            err_body = ""
+            try:
+                err_body = e.read().decode("utf-8", "replace")
+            except Exception:
+                pass
+            err_code, err_msg = _parse_api_error(err_body)
+            detail = err_msg or err_body[:200]
+
+            # Gemini reports an invalid API key as HTTP 400 (reason API_KEY_INVALID), not
+            # 401/403. Without this the key was never benched and never rotated past, so with
+            # one bad key among several roughly 1-in-N transforms hard-failed forever.
+            if e.code in (400, 422) and (
+                    "api_key_invalid" in (err_code or "").lower()
+                    or "api_key_invalid" in detail.lower()
+                    or "api key not valid" in detail.lower()):
+                mark_key_invalid(key)
+                failure_reason = "API key rejected by the provider. Check your keys in config.json."
+                continue
+
             if e.code in (400, 422) and err_type == ERR_OTHER:
+                # A JSON-validation failure is NOT a tuning problem. This app never sends
+                # response_format, so json_validate_failed can only come from a custom
+                # endpoint that enforces JSON itself — either way, blaming the reasoning
+                # params would be wrong. Retry degraded, then report plainly.
+                if err_code == "json_validate_failed" or "failed to validate json" in detail.lower():
+                    log("Provider could not produce valid JSON — retrying without tuning/format")
+                    degraded_result = _call_degraded(text, system_content, key)
+                    if degraded_result is not None:
+                        return degraded_result, None
+                    failure_reason = "Model could not produce a valid response. Try again."
+                    break
+
+                # Only call it a rejected model setting when the provider named one of the
+                # parameters we actually sent. A custom endpoint receives none, so the
+                # "degraded" request would be byte-identical to the one that just failed:
+                # skip it rather than burn a second call and risk blaming a param never sent.
+                # Match on the parsed message only — `detail` can fall back to the raw body,
+                # and endpoints that echo the request back would then contain our param names.
+                named = _named_tuning_param(err_msg) if provider in ("groq", "gemini") else None
+                if provider not in ("groq", "gemini"):
+                    failure_reason = (f"Request rejected (HTTP {e.code}): {_redact_secrets(detail)}"
+                                      if detail else f"API error (HTTP {e.code}).")
+                    break
                 degraded_result = _call_degraded(text, system_content, key)
                 if degraded_result is not None:
-                    log("Degraded retry (without tuning params) succeeded")
+                    if named:
+                        log(f"Degraded retry succeeded — provider rejected '{named}'")
+                        _notify_debounced(
+                            f"Model setting '{named}' was rejected by the provider and skipped - "
+                            f"your text was still processed. Please report this on the SwiftSlate GitHub.",
+                            NIIF_WARNING)
+                    else:
+                        log("Degraded retry (without tuning params) succeeded")
                     return degraded_result, None
+                failure_reason = (f"Request rejected (HTTP {e.code}): {_redact_secrets(detail)}"
+                                  if detail else f"API error (HTTP {e.code}).")
+                break
 
             if err_type == ERR_RATE_LIMIT:
                 # Try to extract Retry-After header
@@ -765,10 +941,19 @@ def call_api(text, prompt):
                 except Exception:
                     pass
                 report_rate_limit(key, retry_after)
+                # Set a reason now: if every key ends up rate limited the loop exits here and
+                # the final fallback used to report "All N attempts failed: HTTPError." — a
+                # Python class name, for the single most common real failure.
+                failure_reason = "All API keys are rate limited. Wait a moment and try again."
                 continue  # Try next key
 
             elif err_type == ERR_INVALID_KEY:
                 mark_key_invalid(key)
+                # 403 is not necessarily a bad key — it is also what both providers return when
+                # the selected model is not available to the key's project — so do not assert
+                # the keys are wrong.
+                failure_reason = (f"API key rejected (HTTP {e.code}). Check your keys, and that "
+                                  f"'{model}' is available to them.")
                 continue  # Try next key
 
             elif err_type == ERR_SERVER:
@@ -776,10 +961,18 @@ def call_api(text, prompt):
                 continue  # 5xx — try next key
 
             else:
-                failure_reason = f"API error (HTTP {e.code})."
+                # Parity with Android: an unknown/inaccessible model is a 404 whose reason sits
+                # in error.code, and "API error (HTTP 404)" gave the user nothing to act on.
+                if e.code == 404 or err_code == "model_not_found":
+                    failure_reason = (f"Model '{model}' not found or not available to this key. "
+                                      f"Check the model in config.json.")
+                elif detail:
+                    failure_reason = f"API error (HTTP {e.code}): {_redact_secrets(detail)}"
+                else:
+                    failure_reason = f"API error (HTTP {e.code})."
                 break  # Non-retryable (400, etc.)
 
-        except (urllib.error.URLError, TimeoutError, OSError) as e:
+        except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException) as e:
             last_error = e
             err_type = classify_error(e)
             log(f"Attempt {attempt+1}/{max_attempts}: {err_type} - {e}")
@@ -853,14 +1046,43 @@ def _call_gemini(text, system_content, key):
 
     # Let exceptions propagate to call_api retry loop
     with urllib.request.urlopen(req, timeout=45) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
-        candidates = data.get("candidates", [])
+        try:
+            data = json.loads(resp.read().decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            raise ApiResponseError("Provider returned an unreadable response. Try again.")
+        if not isinstance(data, dict):
+            raise ApiResponseError("Provider returned an unexpected response. Try again.")
+        try:
+            candidates = data.get("candidates") or []
+            first = candidates[0] if candidates else None
+            if candidates and not isinstance(first, dict):
+                raise ApiResponseError("Provider returned an unreadable response. Try again.")
+        except (AttributeError, TypeError, IndexError):
+            raise ApiResponseError("Provider returned an unreadable response. Try again.")
         if candidates:
-            parts = candidates[0].get("content", {}).get("parts", [])
-            if parts:
-                result = (parts[0].get("text") or "").strip()
-                return strip_markdown_fences(result)
-    return None
+            try:
+                finish = candidates[0].get("finishReason", "")
+                if finish in ("SAFETY", "RECITATION", "PROHIBITED_CONTENT", "SPII", "BLOCKLIST"):
+                    raise ApiResponseError("Response blocked by safety filters. Try rephrasing.")
+                # `content` can be JSON null, and parts[0] need not be an object — both used to
+                # escape as "Unexpected error: AttributeError." instead of a real message.
+                parts = (candidates[0].get("content") or {}).get("parts") or []
+                result = (parts[0].get("text") or "").strip() if parts else ""
+            except ApiResponseError:
+                raise
+            except (AttributeError, TypeError, KeyError, IndexError):
+                raise ApiResponseError("Provider returned an unreadable response. Try again.")
+            if not parts:
+                raise ApiResponseError("Model returned no content. Try again.")
+            if not result:
+                raise ApiResponseError("Model returned an empty response. Try again.")
+            return strip_markdown_fences(result)
+    # No candidates at all: Gemini blocks the *prompt* this way, reporting the reason in
+    # promptFeedback.blockReason (mirrors Android's GeminiClient).
+    block = (data.get("promptFeedback") or {}).get("blockReason", "")
+    if block:
+        raise ApiResponseError(f"Prompt blocked by safety filters ({block}). Try rephrasing.")
+    raise ApiResponseError("Provider returned an unexpected response. Try again.")
 
 def _call_openai_compatible(text, system_content, key, endpoint):
     """Call OpenAI-compatible API (Groq, custom endpoints). Raises on HTTP errors.
@@ -893,17 +1115,29 @@ def _call_openai_compatible(text, system_content, key, endpoint):
 
     # Let exceptions propagate to call_api retry loop
     with urllib.request.urlopen(req, timeout=45) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
+        try:
+            data = json.loads(resp.read().decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            raise ApiResponseError("Provider returned an unreadable response. Try again.")
+        if not isinstance(data, dict):
+            raise ApiResponseError("Provider returned an unexpected response. Try again.")
         try:
             # Some OpenAI-compatible providers return "content": null (notably when a
             # content filter fires). None.strip() raises AttributeError, which was not
             # in the except tuple and escaped as an unhandled "Unexpected error".
-            content = data["choices"][0]["message"].get("content")
+            choice = data["choices"][0]
+            if choice.get("finish_reason") == "content_filter":
+                raise ApiResponseError("Response blocked by the provider's content filter. Try rephrasing.")
+            content = choice["message"].get("content")
             result = (content or "").strip()
+            if not result:
+                raise ApiResponseError("Model returned an empty response. Try again.")
             return strip_markdown_fences(result)
+        except ApiResponseError:
+            raise
         except (KeyError, IndexError, TypeError, AttributeError):
             log(f"Malformed API response: {list(data.keys())}")
-            return None
+            raise ApiResponseError("Provider returned an unreadable response. Try again.")
 
 def _call_degraded(text, system_content, key):
     """Retry without thinking/reasoning params on 400/422. Mirrors Android's
@@ -956,8 +1190,12 @@ def _call_degraded(text, system_content, key):
             with urllib.request.urlopen(req, timeout=45) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 try:
-                    return strip_markdown_fences(data["choices"][0]["message"]["content"].strip())
-                except (KeyError, IndexError, TypeError):
+                    # Same null-content guard as _call_openai_compatible: "content": null
+                    # raises AttributeError, which was not in the tuple below.
+                    content = data["choices"][0]["message"].get("content")
+                    if content:
+                        return strip_markdown_fences(content.strip())
+                except (KeyError, IndexError, TypeError, AttributeError):
                     pass
     except Exception as e:
         log(f"Degraded retry also failed: {e}")
@@ -1256,6 +1494,10 @@ def do_transform(trigger_name, prompt):
         full_text, prev_clip = grab_field_text()
         if not full_text or not full_text.strip():
             log("No text captured")
+            # Reading the field is the app's most failure-prone step (Chromium fields, a
+            # contested clipboard, the 1s timeout). Staying silent here made the app look
+            # simply broken; the sibling workers already notify for the same condition.
+            _notify_debounced("Could not read the text in this field.", NIIF_WARNING)
             return
 
         # Record clipboard sequence at grab time — only restore prev_clip if
@@ -1269,6 +1511,7 @@ def do_transform(trigger_name, prompt):
 
         if not input_text.strip():
             log("Empty after stripping trigger")
+            _notify_debounced("No text to transform - type something before the trigger.", NIIF_INFO)
             return
 
         last_original_text = input_text
@@ -1413,10 +1656,16 @@ def do_transform(trigger_name, prompt):
             done_event.wait(timeout=30)
             result = result_holder[0]
             if result:
-                set_clipboard_silent(result)
-                log("Result placed on clipboard (user was typing)")
+                # Don't claim the clipboard holds the result unless the write succeeded.
+                if set_clipboard_silent(result):
+                    log("Result placed on clipboard (user was typing)")
+                    _notify_debounced("You kept typing - result copied to clipboard instead.", NIIF_INFO)
+                else:
+                    log("Result could not be placed on clipboard")
+                    _notify_debounced("You kept typing, and the result could not be saved to the clipboard.", NIIF_ERROR)
             else:
                 log("API returned nothing after abort")
+                _notify_debounced(error_holder[0] or "Transform failed.", NIIF_ERROR)
             # Don't restore prev_clip — leave result on clipboard for user to paste
             prev_clip = None
         elif user32.GetForegroundWindow() == hwnd:
@@ -1425,9 +1674,12 @@ def do_transform(trigger_name, prompt):
             if result:
                 if not _retry_paste(result):
                     # Paste failed — put result on clipboard so user can paste manually
-                    set_clipboard_silent(result)
-                    log("Paste failed — result placed on clipboard")
-                    _notify_debounced("Paste failed. Result copied to clipboard.", NIIF_WARNING)
+                    if set_clipboard_silent(result):
+                        log("Paste failed — result placed on clipboard")
+                        _notify_debounced("Paste failed. Result copied to clipboard.", NIIF_WARNING)
+                    else:
+                        log("Paste failed and clipboard write failed")
+                        _notify_debounced("Could not insert the result. Try again.", NIIF_ERROR)
                     prev_clip = None
             else:
                 # API failed — restore original text (remove spinner)
@@ -1436,10 +1688,15 @@ def do_transform(trigger_name, prompt):
                 _notify_debounced(error_reason or "Transform failed.", NIIF_ERROR)
         else:
             # Window not focused - put result on clipboard for manual paste
-            set_clipboard_silent(result if result else input_text)
-            log("Result on clipboard (window not focused)")
+            clip_ok = set_clipboard_silent(result if result else input_text)
+            log(f"Result on clipboard (window not focused), ok={clip_ok}")
             if not result:
                 _notify_debounced(error_reason or "Transform failed.", NIIF_ERROR)
+            elif clip_ok:
+                # Same reasoning as the abort path: tell the user where the result went.
+                _notify_debounced("Window lost focus - result copied to clipboard.", NIIF_INFO)
+            else:
+                _notify_debounced("Window lost focus and the result could not be saved to the clipboard.", NIIF_ERROR)
             # Don't restore prev_clip — leave result available
             prev_clip = None
     finally:
@@ -1467,16 +1724,28 @@ def do_undo():
     try:
         if not last_original_text:
             log("Nothing to undo")
+            _notify_debounced("Nothing to undo.", NIIF_INFO)
             return
 
         _, prev_clip = grab_field_text()
-        paste_text(last_original_text)
-        last_original_text = None
+        if paste_text(last_original_text):
+            # Only discard the undo point once the text is actually back. Clearing it
+            # unconditionally destroyed the original on a failed paste, and the next ?undo
+            # then reported "Nothing to undo."
+            last_original_text = None
+            log("Undo complete")
+        else:
+            log("Undo paste failed — keeping undo state")
+            _notify_debounced("Could not undo.", NIIF_ERROR)
 
         time.sleep(0.2)
         if prev_clip:
             set_clipboard_silent(prev_clip)
-        log("Undo complete")
+    except Exception as e:
+        # Without this the daemon thread dies silently under pythonw (no console, and no
+        # log file unless --debug), so the trigger appeared to do nothing at all.
+        log(f"Undo failed: {e}")
+        _notify_debounced("Could not undo.", NIIF_ERROR)
     finally:
         processing = False
 
@@ -1491,35 +1760,73 @@ def do_clipboard_command(command):
 
         if not full_text:
             log("No text captured")
+            _notify_debounced("Could not read the text in this field.", NIIF_WARNING)
+            # grab_field_text() empties the clipboard to get a sequence-number baseline, so
+            # returning without restoring left the user holding an empty clipboard.
+            if prev_clip:
+                set_clipboard_silent(prev_clip)
             return
 
-        if full_text.endswith(trigger_full):
-            text_before = full_text[:-len(trigger_full)].rstrip()
-        else:
-            text_before = full_text or ""
+        # The trigger must be the last thing in the field. grab_field_text() selects all, so
+        # full_text is the WHOLE field; without this guard ?cut replaced the entire field with
+        # "" (and still toasted success) when the trigger sat mid-text.
+        if not full_text.endswith(trigger_full):
+            log("Clipboard command: trigger not at end of field, leaving text unchanged")
+            _notify_debounced(f"{prefix}{command} only works at the end of the text.", NIIF_WARNING)
+            if prev_clip:
+                set_clipboard_silent(prev_clip)
+            return
+        text_before = full_text[:-len(trigger_full)].rstrip()
 
         if command == "copy":
-            internal_clipboard = text_before
-            paste_text(text_before)
-            log(f"Copied: {len(text_before)} chars")
+            if not text_before.strip():
+                paste_text(text_before)
+                log("Nothing to copy")
+                _notify_debounced("Nothing to copy.", NIIF_INFO)
+            elif paste_text(text_before):
+                internal_clipboard = text_before
+                log(f"Copied: {len(text_before)} chars")
+                _notify_debounced(f"Copied - use {prefix}paste to insert it.", NIIF_INFO)
+            else:
+                log("Copy failed: could not update the field")
+                _notify_debounced(f"{prefix}copy failed.", NIIF_ERROR)
         elif command == "cut":
-            internal_clipboard = text_before
-            paste_text("")
-            log(f"Cut: {len(text_before)} chars")
+            if not text_before.strip():
+                paste_text(text_before)
+                log("Nothing to cut")
+                _notify_debounced("Nothing to cut.", NIIF_INFO)
+            elif paste_text(""):
+                internal_clipboard = text_before
+                log(f"Cut: {len(text_before)} chars")
+                _notify_debounced(f"Cut - use {prefix}paste to insert it.", NIIF_INFO)
+            else:
+                # Never claim the text was cut while it is still sitting in the field.
+                log("Cut failed: could not update the field")
+                _notify_debounced(f"{prefix}cut failed.", NIIF_ERROR)
         elif command == "paste" and internal_clipboard:
-            paste_text(text_before + internal_clipboard)
-            log("Pasted")
+            if paste_text(text_before + internal_clipboard):
+                log("Pasted")
+            else:
+                log("Paste failed")
+                _notify_debounced(f"{prefix}paste failed.", NIIF_ERROR)
         elif command == "replace" and internal_clipboard:
-            paste_text(internal_clipboard)
-            log("Replaced")
+            if paste_text(internal_clipboard):
+                log("Replaced")
+            else:
+                log("Replace failed")
+                _notify_debounced(f"{prefix}replace failed.", NIIF_ERROR)
         else:
             # No internal clipboard - restore field without trigger
             paste_text(text_before)
             log(f"Nothing to {command}")
+            _notify_debounced(f"Nothing copied yet - use {prefix}copy or {prefix}cut first.", NIIF_INFO)
 
         time.sleep(0.2)
         if prev_clip:
             set_clipboard_silent(prev_clip)
+    except Exception as e:
+        log(f"Clipboard command failed: {e}")
+        _notify_debounced("Clipboard operation failed.", NIIF_ERROR)
     finally:
         processing = False
 
@@ -1534,6 +1841,11 @@ def do_replacer(trigger_name, cmd_type, value):
 
         if not full_text:
             log("No text captured")
+            _notify_debounced("Could not read the text in this field.", NIIF_WARNING)
+            # grab_field_text() empties the clipboard for its sequence baseline, so returning
+            # without restoring left the user holding an empty clipboard.
+            if prev_clip:
+                set_clipboard_silent(prev_clip)
             return
 
         # The trigger must be at the end of the captured text. grab_field_text() does a
@@ -1545,6 +1857,7 @@ def do_replacer(trigger_name, cmd_type, value):
         # do nothing but put the user's clipboard back.
         if not full_text.endswith(trigger_full):
             log("Replacer: trigger not at end of field, leaving text unchanged")
+            _notify_debounced(f"{prefix}{trigger_name} only works at the end of the text.", NIIF_WARNING)
             if prev_clip:
                 set_clipboard_silent(prev_clip)
             return
@@ -1552,6 +1865,7 @@ def do_replacer(trigger_name, cmd_type, value):
         before = full_text[:-len(trigger_full)]
 
         replacement = ""
+        shell_error = None
         if cmd_type == "replacer-text":
             replacement = value
         elif cmd_type == "replacer-shell":
@@ -1561,10 +1875,15 @@ def do_replacer(trigger_name, cmd_type, value):
                     timeout=3, creationflags=subprocess.CREATE_NO_WINDOW
                 )
                 replacement = proc.stdout.strip()
+                if not replacement:
+                    # Distinguish "ran, produced nothing" from a crash: stderr/returncode say which.
+                    shell_error = (proc.stderr or "").strip()[:120] or f"command produced no output (exit {proc.returncode})"
             except subprocess.TimeoutExpired:
                 log("Shell command timed out (3s)")
+                shell_error = "command timed out after 3s"
             except Exception as e:
                 log(f"Shell command failed: {e}")
+                shell_error = str(e)[:120]
 
         if replacement:
             if abort_event.is_set():
@@ -1577,10 +1896,21 @@ def do_replacer(trigger_name, cmd_type, value):
             # Failure - restore text without trigger
             paste_text(before.rstrip() if before else (full_text or ""))
             log("Replacer failed, restored text")
+            # A shell replacer that times out, crashes or isn't on PATH used to restore the
+            # text silently, indistinguishable from success with empty output.
+            if shell_error:
+                # Redact like provider text: a replacer command can carry a token and the tool
+                # may echo the failing invocation back on stderr.
+                _notify_debounced(f"{prefix}{trigger_name} failed: {_redact_secrets(shell_error)}", NIIF_ERROR)
+            else:
+                _notify_debounced(f"{prefix}{trigger_name} produced no text.", NIIF_WARNING)
 
         time.sleep(0.2)
         if prev_clip:
             set_clipboard_silent(prev_clip)
+    except Exception as e:
+        log(f"Replacer failed: {e}")
+        _notify_debounced(f"{prefix}{trigger_name} failed.", NIIF_ERROR)
     finally:
         processing = False
 
@@ -1838,7 +2168,13 @@ def main():
     wc.lpszClassName = class_name
 
     if not user32.RegisterClassExW(ctypes.byref(wc)):
+        # These three startup aborts used to log and exit silently. Under pythonw there is
+        # no console, and no log file unless --debug, so the user double-clicked and simply
+        # nothing happened, forever. MessageBoxW is used directly because the tray icon does
+        # not exist yet at this point.
         log("Failed to register window class")
+        ctypes.windll.user32.MessageBoxW(
+            None, "SwiftSlate could not start: failed to register its window class.", "SwiftSlate", 0x10)
         return
 
     # Create hidden window
@@ -1850,6 +2186,8 @@ def main():
 
     if not hwnd_main:
         log("Failed to create window")
+        ctypes.windll.user32.MessageBoxW(
+            None, "SwiftSlate could not start: failed to create its message window.", "SwiftSlate", 0x10)
         return
 
     # Register Raw Input
@@ -1861,6 +2199,11 @@ def main():
 
     if not user32.RegisterRawInputDevices(ctypes.byref(rid), 1, ctypes.sizeof(RAWINPUTDEVICE)):
         log("Failed to register Raw Input")
+        ctypes.windll.user32.MessageBoxW(
+            None,
+            "SwiftSlate could not start: keyboard input registration failed.\n\n"
+            "Another program may already be capturing keyboard input. Close it and try again.",
+            "SwiftSlate", 0x10)
         return
 
     log("Raw Input registered")
