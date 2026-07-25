@@ -229,9 +229,12 @@ def strip_markdown_fences(text):
 # it needs; sending wrong params returns HTTP 400.
 GROQ_MODEL_PARAMS = {
     # GPT-OSS: cannot fully disable reasoning; "medium" balances quality and latency (~1s).
-    # max_completion_tokens=16384 prevents json_validate_failed when reasoning tokens
-    # exhaust Groq's default 3072 cap (especially with json_object mode enabled).
-    "openai/gpt-oss-120b": {"reasoning_effort": "medium", "include_reasoning": False, "max_completion_tokens": 16384},
+    # Deliberately NO max_completion_tokens: Groq pre-reserves that value against the
+    # per-minute token budget (Requested = prompt_tokens + max_completion_tokens) and this
+    # model's TPM limit is only 8,000 on the free/on-demand tier. Any value at or near
+    # 8,000 makes every single request fail with HTTP 413 "Request too large" before it
+    # reaches the model. Groq's own default is ample for medium effort.
+    "openai/gpt-oss-120b": {"reasoning_effort": "medium", "include_reasoning": False},
     # Qwen 3.x: fully disable reasoning ("low"/"medium"/"high" return 400)
     "qwen/qwen3.6-27b": {"reasoning_effort": "none"},
 }
