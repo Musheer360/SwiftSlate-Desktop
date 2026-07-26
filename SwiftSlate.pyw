@@ -4,6 +4,7 @@ System-wide AI text transformation
 https://github.com/Musheer360/SwiftSlate-Desktop
 """
 
+import collections
 import ctypes
 import ctypes.wintypes as wt
 import json
@@ -36,12 +37,10 @@ CW_USEDEFAULT = -2147483648  # 0x80000000 as signed c_int
 NIM_ADD = 0x00000000
 NIM_MODIFY = 0x00000001
 NIM_DELETE = 0x00000002
-NIM_SETVERSION = 0x00000004
+NIF_MESSAGE = 0x00000001
 NIF_ICON = 0x00000002
 NIF_TIP = 0x00000004
 NIF_INFO = 0x00000010
-NIF_SHOWTIP = 0x00000080
-NIIF_NONE = 0x00000000
 NIIF_INFO = 0x00000001
 NIIF_WARNING = 0x00000002
 NIIF_ERROR = 0x00000003
@@ -806,6 +805,25 @@ def _check_network():
             continue
     return False
 
+def is_model_refusal(text: str) -> bool:
+    """Detects whether an LLM output string is an in-band safety refusal
+    (e.g. "I'm sorry, but I can't help with that") rather than a valid
+    text transformation, to prevent overwriting user input with refusal text."""
+    if not text:
+        return False
+    head = text.strip()[:200].lower()
+    signatures = [
+        "can't help with that", "cannot help with that",
+        "can't comply with", "cannot comply with",
+        "cannot fulfill the request", "cannot fulfill this request", "cannot fulfill your request",
+        "unable to fulfill the request", "unable to fulfill your request",
+        "as an ai", "as an assistant",
+        "safety guidelines", "safety policy", "helpful and harmless",
+        "violates our policy", "violates safety"
+    ]
+    lower = text.lower()
+    return any(sig in head for sig in signatures) or "safety guidelines" in lower or "violates our policy" in lower
+
 def call_api(text, prompt):
     """Call API with key rotation and retry on transient errors.
     On network/timeout failures, checks connectivity first before retrying.
@@ -823,13 +841,15 @@ def call_api(text, prompt):
             if not api_keys:
                 failure_reason = "No API keys configured. Add one to config.json."
             elif sum(1 for k in api_keys if _is_key_invalid(k)) >= len(api_keys):
-                failure_reason = ("All API keys were rejected by the provider. Check your keys, and "
-                                  f"that '{model}' is available to them.")
+                if len(api_keys) > 1 and key:
+                    hint = f"••••{key[-4:]}" if len(key) >= 4 else "key"
+                    failure_reason = f"All API keys were rejected by the provider ({hint}). Check your keys in config.json."
+                else:
+                    failure_reason = ("All API keys were rejected by the provider. Check your keys, and "
+                                      f"that '{model}' is available to them.")
             elif any(time.time() <= _rate_limited_keys.get(k, 0) for k in api_keys):
                 failure_reason = "All API keys are rate limited. Wait a moment and try again."
             elif not failure_reason:
-                # Don't overwrite a reason an earlier attempt already established (e.g. a 5xx),
-                # and don't assert a rate limit that no cooldown actually supports.
                 failure_reason = "No API key was available for this request."
             break
 
@@ -845,8 +865,7 @@ def call_api(text, prompt):
                 return result, None
 
         except ApiResponseError as e:
-            # 200 OK but unusable body. Another key cannot fix it, so stop here and tell the
-            # user what actually happened instead of blaming their keys.
+            # 200 OK but unusable body or in-band refusal. Another key cannot fix it.
             last_error = e
             failure_reason = str(e)
             log(f"Attempt {attempt+1}/{max_attempts}: unusable response - {e}")
@@ -857,22 +876,13 @@ def call_api(text, prompt):
             last_error = e
             log(f"Attempt {attempt+1}/{max_attempts}: HTTP {e.code} ({err_type})")
 
-            # 413 = the request exceeds this key's per-minute token budget. Groq
-            # enforces TPM per organization, so a different key (different org) may
-            # still have headroom — rotate instead of hard-failing. Short cooldown
-            # because the budget refills every minute.
+            # 413 = per-minute token budget limit exceeded. Fail fast without key rotation
             if e.code == 413:
-                log("Request too large for this key's token budget — trying next key")
-                report_rate_limit(key, 10)
-                # Set a reason now: if every key rejects the size the loop ends here and the
-                # generic fallback used to report "All N attempts failed: HTTPError."
+                log("Request too large for per-minute token limit — failing fast")
                 failure_reason = ("Text is too long for this model's per-minute token limit. "
                                   "Select less text and try again.")
-                continue
+                break
 
-            # Degradation, in attribution order (mirrors Android's ladder).
-            # Read the body once: Groq puts the machine-readable reason in error.code and
-            # names the offending property in error.message.
             err_body = ""
             try:
                 err_body = e.read().decode("utf-8", "replace")
@@ -881,58 +891,27 @@ def call_api(text, prompt):
             err_code, err_msg = _parse_api_error(err_body)
             detail = err_msg or err_body[:200]
 
-            # Gemini reports an invalid API key as HTTP 400 (reason API_KEY_INVALID), not
-            # 401/403. Without this the key was never benched and never rotated past, so with
-            # one bad key among several roughly 1-in-N transforms hard-failed forever.
+            # Gemini reports an invalid API key as HTTP 400 (reason API_KEY_INVALID), not 401/403.
             if e.code in (400, 422) and (
                     "api_key_invalid" in (err_code or "").lower()
                     or "api_key_invalid" in detail.lower()
                     or "api key not valid" in detail.lower()):
                 mark_key_invalid(key)
-                failure_reason = "API key rejected by the provider. Check your keys in config.json."
+                if len(api_keys) > 1:
+                    hint = f"••••{key[-4:]}" if len(key) >= 4 else "key"
+                    failure_reason = f"Invalid API key ({hint}). Check your keys in config.json."
+                else:
+                    failure_reason = "Invalid API key. Check your key in config.json."
                 continue
 
-            if e.code in (400, 422) and err_type == ERR_OTHER:
-                # A JSON-validation failure is NOT a tuning problem. This app never sends
-                # response_format, so json_validate_failed can only come from a custom
-                # endpoint that enforces JSON itself — either way, blaming the reasoning
-                # params would be wrong. Retry degraded, then report plainly.
-                if err_code == "json_validate_failed" or "failed to validate json" in detail.lower():
-                    log("Provider could not produce valid JSON — retrying without tuning/format")
-                    degraded_result = _call_degraded(text, system_content, key)
-                    if degraded_result is not None:
-                        return degraded_result, None
-                    failure_reason = "Model could not produce a valid response. Try again."
-                    break
-
-                # Only call it a rejected model setting when the provider named one of the
-                # parameters we actually sent. A custom endpoint receives none, so the
-                # "degraded" request would be byte-identical to the one that just failed:
-                # skip it rather than burn a second call and risk blaming a param never sent.
-                # Match on the parsed message only — `detail` can fall back to the raw body,
-                # and endpoints that echo the request back would then contain our param names.
-                named = _named_tuning_param(err_msg) if provider in ("groq", "gemini") else None
-                if provider not in ("groq", "gemini"):
-                    failure_reason = (f"Request rejected (HTTP {e.code}): {_redact_secrets(detail)}"
-                                      if detail else f"API error (HTTP {e.code}).")
-                    break
-                degraded_result = _call_degraded(text, system_content, key)
-                if degraded_result is not None:
-                    if named:
-                        log(f"Degraded retry succeeded — provider rejected '{named}'")
-                        _notify_debounced(
-                            f"Model setting '{named}' was rejected by the provider and skipped - "
-                            f"your text was still processed. Please report this on the SwiftSlate GitHub.",
-                            NIIF_WARNING)
-                    else:
-                        log("Degraded retry (without tuning params) succeeded")
-                    return degraded_result, None
-                failure_reason = (f"Request rejected (HTTP {e.code}): {_redact_secrets(detail)}"
-                                  if detail else f"API error (HTTP {e.code}).")
+            if e.code in (400, 422):
+                if err_code == "json_validate_failed" or "failed to validate json" in detail.lower() or "response_format" in detail.lower():
+                    failure_reason = "Could not format the response properly. Try again."
+                else:
+                    failure_reason = "Request failed. Check your settings in config.json."
                 break
 
             if err_type == ERR_RATE_LIMIT:
-                # Try to extract Retry-After header
                 retry_after = 60
                 try:
                     ra = e.headers.get("Retry-After")
@@ -941,35 +920,29 @@ def call_api(text, prompt):
                 except Exception:
                     pass
                 report_rate_limit(key, retry_after)
-                # Set a reason now: if every key ends up rate limited the loop exits here and
-                # the final fallback used to report "All N attempts failed: HTTPError." — a
-                # Python class name, for the single most common real failure.
                 failure_reason = "All API keys are rate limited. Wait a moment and try again."
                 continue  # Try next key
 
             elif err_type == ERR_INVALID_KEY:
                 mark_key_invalid(key)
-                # 403 is not necessarily a bad key — it is also what both providers return when
-                # the selected model is not available to the key's project — so do not assert
-                # the keys are wrong.
-                failure_reason = (f"API key rejected (HTTP {e.code}). Check your keys, and that "
-                                  f"'{model}' is available to them.")
+                if len(api_keys) > 1:
+                    hint = f"••••{key[-4:]}" if len(key) >= 4 else "key"
+                    failure_reason = f"Invalid API key ({hint}). Check your keys in config.json."
+                else:
+                    failure_reason = (f"API key rejected. Check your keys, and that "
+                                      f"'{model}' is available to them.")
                 continue  # Try next key
 
             elif err_type == ERR_SERVER:
-                failure_reason = f"Server error (HTTP {e.code}). Provider may be down."
+                failure_reason = "Server error. Could not reach the API."
                 continue  # 5xx — try next key
 
             else:
-                # Parity with Android: an unknown/inaccessible model is a 404 whose reason sits
-                # in error.code, and "API error (HTTP 404)" gave the user nothing to act on.
                 if e.code == 404 or err_code == "model_not_found":
                     failure_reason = (f"Model '{model}' not found or not available to this key. "
                                       f"Check the model in config.json.")
-                elif detail:
-                    failure_reason = f"API error (HTTP {e.code}): {_redact_secrets(detail)}"
                 else:
-                    failure_reason = f"API error (HTTP {e.code})."
+                    failure_reason = "Request failed. Check your settings in config.json."
                 break  # Non-retryable (400, etc.)
 
         except (urllib.error.URLError, TimeoutError, OSError, http.client.HTTPException) as e:
@@ -1076,7 +1049,10 @@ def _call_gemini(text, system_content, key):
                 raise ApiResponseError("Model returned no content. Try again.")
             if not result:
                 raise ApiResponseError("Model returned an empty response. Try again.")
-            return strip_markdown_fences(result)
+            cleaned = strip_markdown_fences(result)
+            if is_model_refusal(cleaned):
+                raise ApiResponseError("Response blocked by safety filters. Try rephrasing.")
+            return cleaned
     # No candidates at all: Gemini blocks the *prompt* this way, reporting the reason in
     # promptFeedback.blockReason (mirrors Android's GeminiClient).
     block = (data.get("promptFeedback") or {}).get("blockReason", "")
@@ -1132,74 +1108,15 @@ def _call_openai_compatible(text, system_content, key, endpoint):
             result = (content or "").strip()
             if not result:
                 raise ApiResponseError("Model returned an empty response. Try again.")
-            return strip_markdown_fences(result)
+            cleaned = strip_markdown_fences(result)
+            if is_model_refusal(cleaned):
+                raise ApiResponseError("Response blocked by safety filters. Try rephrasing.")
+            return cleaned
         except ApiResponseError:
             raise
         except (KeyError, IndexError, TypeError, AttributeError):
             log(f"Malformed API response: {list(data.keys())}")
             raise ApiResponseError("Provider returned an unreadable response. Try again.")
-
-def _call_degraded(text, system_content, key):
-    """Retry without thinking/reasoning params on 400/422. Mirrors Android's
-    graceful degradation: working-but-unoptimized beats a hard failure."""
-    try:
-        if provider == "gemini":
-            safe_model = urllib.parse.quote(model, safe="")
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{safe_model}:generateContent"
-            safety_settings = []
-            for cat in ("HARM_CATEGORY_HARASSMENT", "HARM_CATEGORY_HATE_SPEECH",
-                        "HARM_CATEGORY_SEXUALLY_EXPLICIT", "HARM_CATEGORY_DANGEROUS_CONTENT",
-                        "HARM_CATEGORY_CIVIC_INTEGRITY"):
-                safety_settings.append({"category": cat, "threshold": "BLOCK_NONE"})
-            body = json.dumps({
-                "systemInstruction": {"parts": [{"text": system_content}]},
-                "contents": [{"parts": [{"text": wrap_user_text(text)}]}],
-                "safetySettings": safety_settings,
-                "generationConfig": {"temperature": temperature}  # No thinkingConfig
-            }).encode("utf-8")
-            req = urllib.request.Request(url, data=body, headers={
-                "Content-Type": "application/json",
-                "x-goog-api-key": key,
-                "User-Agent": "SwiftSlate/1.0",
-            }, method="POST")
-            with urllib.request.urlopen(req, timeout=45) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                candidates = data.get("candidates", [])
-                if candidates:
-                    parts = candidates[0].get("content", {}).get("parts", [])
-                    if parts:
-                        return strip_markdown_fences((parts[0].get("text") or "").strip())
-        else:
-            endpoint = custom_endpoint if provider == "custom" else "https://api.groq.com/openai/v1"
-            url = f"{endpoint.rstrip('/')}/chat/completions"
-            # Vanilla request — no reasoning_effort, no include_reasoning
-            request_body = {
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": system_content},
-                    {"role": "user", "content": wrap_user_text(text)}
-                ],
-                "temperature": temperature
-            }
-            body = json.dumps(request_body).encode("utf-8")
-            req = urllib.request.Request(url, data=body, headers={
-                "Authorization": f"Bearer {key}",
-                "Content-Type": "application/json",
-                "User-Agent": "SwiftSlate/1.0",
-            }, method="POST")
-            with urllib.request.urlopen(req, timeout=45) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                try:
-                    # Same null-content guard as _call_openai_compatible: "content": null
-                    # raises AttributeError, which was not in the tuple below.
-                    content = data["choices"][0]["message"].get("content")
-                    if content:
-                        return strip_markdown_fences(content.strip())
-                except (KeyError, IndexError, TypeError, AttributeError):
-                    pass
-    except Exception as e:
-        log(f"Degraded retry also failed: {e}")
-    return None
 
 # --- Clipboard (silent, no history pollution) ---
 def set_clipboard_silent(text):
@@ -2036,9 +1953,6 @@ def _process_keystroke_inner(vkey, scan_code):
             continue
 
         keystroke_buffer.append(ch)
-
-    if len(keystroke_buffer) > max_buffer_len:
-        keystroke_buffer = keystroke_buffer[-max_buffer_len:]
 
     # Use last appended character for trigger detection
     if not keystroke_buffer:
