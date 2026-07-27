@@ -132,6 +132,14 @@ kernel32.GetModuleHandleW.restype = wt.HMODULE
 user32.LoadIconW.argtypes = [wt.HINSTANCE, wt.LPCWSTR]
 user32.LoadIconW.restype = wt.HICON
 
+class GUID(ctypes.Structure):
+    _fields_ = [
+        ("Data1", wt.DWORD),
+        ("Data2", wt.WORD),
+        ("Data3", wt.WORD),
+        ("Data4", ctypes.c_ubyte * 8),
+    ]
+
 class NOTIFYICONDATAW(ctypes.Structure):
     _fields_ = [
         ("cbSize", wt.DWORD),
@@ -147,7 +155,7 @@ class NOTIFYICONDATAW(ctypes.Structure):
         ("uVersion", wt.UINT),
         ("szInfoTitle", wt.WCHAR * 64),
         ("dwInfoFlags", wt.DWORD),
-        ("guidItem", ctypes.c_byte * 16),
+        ("guidItem", GUID),
         ("hBalloonIcon", wt.HICON),
     ]
 
