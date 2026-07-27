@@ -905,8 +905,8 @@ def call_api(text, prompt):
                 continue
 
             if e.code in (400, 422):
-                if err_code == "json_validate_failed" or "failed to validate json" in detail.lower() or "response_format" in detail.lower():
-                    failure_reason = "Could not format the response properly. Try again."
+                if err_code == "json_validate_failed" or "failed to validate json" in detail.lower() or "failed_generation" in detail.lower() or "response_format" in detail.lower():
+                    failure_reason = "Response blocked by safety filters. Try rephrasing."
                 else:
                     failure_reason = "Request failed. Check your settings in config.json."
                 break
