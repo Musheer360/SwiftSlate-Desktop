@@ -804,13 +804,13 @@ def classify_error(e, http_code=None):
 
 # --- API call with retry ---
 def _check_network():
-    """Quick network connectivity check — raw TCP connect to known DNS servers.
-    No DNS resolution, no TLS, no HTTP — just checks if we can reach the internet.
+    """Quick network connectivity check — raw TCP connect to known HTTPS servers.
+    No DNS resolution, no TLS handshake, no HTTP — just checks if we can reach the internet.
     Returns in <3s worst case."""
     import socket
     for host in ("1.1.1.1", "8.8.8.8"):
         try:
-            sock = socket.create_connection((host, 53), timeout=1.5)
+            sock = socket.create_connection((host, 443), timeout=1.5)
             sock.close()
             return True
         except (OSError, socket.timeout):
