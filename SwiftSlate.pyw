@@ -811,7 +811,7 @@ def is_model_refusal(text: str) -> bool:
     text transformation, to prevent overwriting user input with refusal text."""
     if not text:
         return False
-    head = text.strip()[:200].lower()
+    head = text.strip()[:200].lower().replace("’", "'").replace("‘", "'")
     signatures = [
         "can't help with that", "cannot help with that",
         "can't comply with", "cannot comply with",
