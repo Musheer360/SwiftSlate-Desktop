@@ -258,7 +258,7 @@ DEFAULT_GEMINI_MODEL = "gemini-3.5-flash-lite"
 # Pre-allocated buffers for keystroke processing
 key_state = (ctypes.c_ubyte * 256)()
 char_buffer = ctypes.create_unicode_buffer(4)
-keystroke_buffer = []
+keystroke_buffer = collections.deque(maxlen=128)
 max_buffer_len = 128
 last_fg_hwnd = 0  # Track foreground window for buffer clearing
 last_keystroke_time = 0.0  # Timestamp of last keystroke for idle gap detection
