@@ -37,6 +37,7 @@ CW_USEDEFAULT = -2147483648  # 0x80000000 as signed c_int
 NIM_ADD = 0x00000000
 NIM_MODIFY = 0x00000001
 NIM_DELETE = 0x00000002
+NIM_SETVERSION = 0x00000004
 NIF_MESSAGE = 0x00000001
 NIF_ICON = 0x00000002
 NIF_TIP = 0x00000004
@@ -47,6 +48,7 @@ NIIF_WARNING = 0x00000002
 NIIF_ERROR = 0x00000003
 NIIF_NOSOUND = 0x00000010
 NOTIFYICON_VERSION_4 = 4
+WM_TRAYICON = 0x8001
 
 # --- Win32 API ---
 user32 = ctypes.windll.user32
@@ -314,7 +316,8 @@ def _ensure_notify_icon():
     nid.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
     nid.hWnd = hwnd_main
     nid.uID = _NOTIFY_ID
-    nid.uFlags = NIF_ICON | NIF_TIP
+    nid.uFlags = NIF_ICON | NIF_TIP | NIF_SHOWTIP | NIF_MESSAGE
+    nid.uCallbackMessage = WM_TRAYICON
     # Use default app icon (Python's icon shows in header, which is fine)
     nid.hIcon = user32.LoadIconW(None, ctypes.cast(32512, wt.LPCWSTR))
     nid.szTip = "SwiftSlate Desktop"
