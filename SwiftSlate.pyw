@@ -41,6 +41,7 @@ NIF_MESSAGE = 0x00000001
 NIF_ICON = 0x00000002
 NIF_TIP = 0x00000004
 NIF_INFO = 0x00000010
+NIF_SHOWTIP = 0x00000080
 NIIF_INFO = 0x00000001
 NIIF_WARNING = 0x00000002
 NIIF_ERROR = 0x00000003
@@ -305,7 +306,7 @@ def _ensure_notify_icon():
     nid.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
     nid.hWnd = hwnd_main
     nid.uID = _NOTIFY_ID
-    nid.uFlags = NIF_ICON | NIF_TIP | NIF_SHOWTIP
+    nid.uFlags = NIF_ICON | NIF_TIP
     # Use default app icon (Python's icon shows in header, which is fine)
     nid.hIcon = user32.LoadIconW(None, ctypes.cast(32512, wt.LPCWSTR))
     nid.szTip = "SwiftSlate Desktop"
