@@ -279,10 +279,10 @@ keystroke_buffer = collections.deque(maxlen=128)
 max_buffer_len = 128
 # MAX_COMMANDS/MAX_TRIGGER_CHARS match Android's CommandManager.MAX_CUSTOM_COMMANDS /
 # MAX_TRIGGER_LENGTH — same resource (configured command count, trigger string length) on
-# both platforms. MAX_FIELD_CHARS stays higher than Android's ProcessTextInput.MAX_CHARS
-# (20k): that bounds a one-shot text-selection share, while this bounds a Ctrl+A grab of
-# whatever's in the focused field, which can legitimately be a full document/email draft.
-MAX_FIELD_CHARS = 100_000
+# both platforms. No cap on how much field text gets sent to the AI: the provider itself
+# rejects an over-length request based on the model's real context window, so a client-side
+# character cutoff would just block users earlier with a made-up number instead of letting
+# the actual limit (which varies per model/provider) decide.
 MAX_COMMANDS = 100
 MAX_TRIGGER_CHARS = 50
 MAX_REPLACER_OUTPUT_BYTES = 65_536
@@ -1464,10 +1464,6 @@ def do_transform(trigger_name, prompt):
             # contested clipboard, the 1s timeout). Staying silent here made the app look
             # simply broken; the sibling workers already notify for the same condition.
             _notify_debounced("Could not read the text in this field.", NIIF_WARNING)
-            return
-        if len(full_text) > MAX_FIELD_CHARS:
-            log(f"Input rejected: {len(full_text)} chars exceeds {MAX_FIELD_CHARS}")
-            _notify_debounced("Text is too long to transform. Select less text and try again.", NIIF_WARNING)
             return
 
         # Record clipboard sequence at grab time — only restore prev_clip if
