@@ -6,6 +6,7 @@ with Android's ApiClientUtilsTest.
 """
 
 import ast
+import re
 from pathlib import Path
 import unittest
 
@@ -13,9 +14,9 @@ import unittest
 def load_helpers():
     source_path = Path(__file__).parents[1] / "SwiftSlate.pyw"
     module = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
-    names = {"strip_markdown_fences", "is_model_refusal"}
+    names = {"strip_markdown_fences", "is_model_refusal", "wrap_user_text", "_redact_secrets"}
     body = [node for node in module.body if isinstance(node, ast.FunctionDef) and node.name in names]
-    namespace = {}
+    namespace = {"re": re}
     exec(compile(ast.Module(body=body, type_ignores=[]), str(source_path), "exec"), namespace)
     return namespace
 
@@ -71,6 +72,11 @@ class ApiUtilsTest(unittest.TestCase):
         self.assertFalse(any(is_refusal(text) for text in ordinary_text))
         self.assertFalse(is_refusal("The quarterly report is attached. " * 10 + "I cannot comply."))
 
+    def test_refusal_detection_blank_input_is_not_a_refusal(self):
+        is_refusal = HELPERS["is_model_refusal"]
+        self.assertFalse(is_refusal(""))
+        self.assertFalse(is_refusal("   \n  "))
+
     def test_markdown_fences_match_android_cases(self):
         strip_fences = HELPERS["strip_markdown_fences"]
         self.assertEqual("hello world", strip_fences("```text\nhello world\n```"))
@@ -79,6 +85,24 @@ class ApiUtilsTest(unittest.TestCase):
         self.assertEqual("line1\nline2", strip_fences("```\nline1\nline2\n```"))
         self.assertEqual("```", strip_fences("```"))
         self.assertEqual("```\n```", strip_fences("```\n```"))
+        self.assertEqual("a ``` in the middle", strip_fences("a ``` in the middle"))
+
+    def test_redact_secrets_masks_provider_echoed_keys(self):
+        redact = HELPERS["_redact_secrets"]
+        self.assertEqual(
+            "Incorrect API key provided: ***",
+            redact("Incorrect API key provided: sk-abc123DEF456ghi"),
+        )
+        self.assertEqual("bad key ***", redact("bad key gsk_ZZZZZZZZZZZZZZZZ"))
+        self.assertEqual("key ***", redact("key AIzaSyAbCdEfGhIjKlMn"))
+
+    def test_redact_secrets_leaves_ordinary_messages_intact(self):
+        redact = HELPERS["_redact_secrets"]
+        self.assertEqual("Model not found.", redact("Model not found."))
+
+    def test_wrap_user_text_fences_input_for_both_providers(self):
+        wrap = HELPERS["wrap_user_text"]
+        self.assertEqual("<input>\nhello\n</input>", wrap("hello"))
 
     def test_response_size_is_bounded(self):
         class Response:

@@ -277,9 +277,14 @@ key_state = (ctypes.c_ubyte * 256)()
 char_buffer = ctypes.create_unicode_buffer(4)
 keystroke_buffer = collections.deque(maxlen=128)
 max_buffer_len = 128
+# MAX_COMMANDS/MAX_TRIGGER_CHARS match Android's CommandManager.MAX_CUSTOM_COMMANDS /
+# MAX_TRIGGER_LENGTH — same resource (configured command count, trigger string length) on
+# both platforms. MAX_FIELD_CHARS stays higher than Android's ProcessTextInput.MAX_CHARS
+# (20k): that bounds a one-shot text-selection share, while this bounds a Ctrl+A grab of
+# whatever's in the focused field, which can legitimately be a full document/email draft.
 MAX_FIELD_CHARS = 100_000
-MAX_COMMANDS = 256
-MAX_TRIGGER_CHARS = 64
+MAX_COMMANDS = 100
+MAX_TRIGGER_CHARS = 50
 MAX_REPLACER_OUTPUT_BYTES = 65_536
 last_fg_hwnd = 0  # Track foreground window for buffer clearing
 last_keystroke_time = 0.0  # Timestamp of last keystroke for idle gap detection
@@ -861,9 +866,10 @@ def call_api(text, prompt):
     On network/timeout failures, checks connectivity first before retrying.
     Returns (result_text, error_reason) — one will be None."""
     system_content = SYSTEM_PROMPT_PREFIX + prompt
-    # A bounded retry budget keeps a hung/misconfigured key set from retaining the
-    # exclusive operation lock indefinitely.
-    max_attempts = min(max(len(api_keys), 1), 3)
+    # One attempt per configured key, matching Android's CommandRunner: get_next_key
+    # already skips keys that are benched (rate-limited/invalid) or already tried in
+    # this call, so the loop naturally stops once every key has had a turn.
+    max_attempts = max(len(api_keys), 1)
     last_error = None
     failure_reason = None
 
@@ -988,7 +994,10 @@ def call_api(text, prompt):
             log(f"Attempt {attempt+1}/{max_attempts}: {err_type} - {e}")
 
             if err_type == ERR_NETWORK:
-                # Network failed — check if internet is even reachable
+                # Network failed — check if internet is even reachable. Distinguishing "no
+                # internet at all" from "provider unreachable but internet is fine" avoids
+                # burning through every configured key on a dead connection and gives a
+                # much clearer error than "provider unreachable" repeated per key.
                 log("Network error — checking connectivity...")
                 if not _check_network():
                     log("No internet — aborting retries")
@@ -2046,11 +2055,13 @@ def _process_keystroke_inner(vkey, scan_code):
             best_trigger = name
             best_len = len(full)
 
-    # Check translate:XX pattern
+    # Check translate:XX pattern — 2-5 char alphanumeric language code, matching Android's
+    # rule (open-ended to support ISO 639 variants like "pt-BR" without a hyphen, without
+    # maintaining a hardcoded list; the AI model handles invalid codes gracefully).
     t_idx = text.rfind(translate_prefix)
     if t_idx >= 0:
         after = text[t_idx + len(translate_prefix):]
-        if 2 <= len(after) <= 5 and after.isalpha():
+        if 2 <= len(after) <= 5 and all(c.isascii() and c.isalnum() for c in after):
             full_trigger = "translate:" + after.lower()
             full_len = len(prefix + full_trigger)
             if full_len > best_len:
