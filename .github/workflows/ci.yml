@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff pyflakes
+
+      - name: Syntax check
+        run: python -m py_compile SwiftSlate.pyw
+
+      - name: Pure-logic regression tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Pyflakes (undefined names, unused imports)
+        run: pyflakes SwiftSlate.pyw
+
+      - name: Ruff (real bugs only)
+        # F = pyflakes rules (undefined names, unused vars)
+        # E9 = syntax errors that prevent execution
+        # B = flake8-bugbear (likely bugs, not style)
+        # UP024/UP041/PLW1510 = fixable modernisation rules
+        # Excluded: BLE001 (broad except is intentional in daemon threads under pythonw),
+        #           RUF012 (ctypes _fields_ pattern, not a real mutable default),
+        #           SIM115 (lock/log file handles must stay open),
+        #           S310 (urllib HTTP client flagged as URL audit — false positive)
+        run: ruff check --select F,E9,B,UP024,UP041,PLW1510 SwiftSlate.pyw
