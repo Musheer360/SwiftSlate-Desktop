@@ -11,6 +11,16 @@ $repo = "https://raw.githubusercontent.com/Musheer360/SwiftSlate-Desktop/master"
 $repoFallback = "https://cdn.jsdelivr.net/gh/Musheer360/SwiftSlate-Desktop@master"
 $repoApi = "https://api.github.com/repos/Musheer360/SwiftSlate-Desktop/contents"
 
+# Expected SHA-256 of the files this installer version downloads. Any maintainer commit
+# that changes SwiftSlate.pyw or commands.json MUST update the matching hash below in the
+# SAME commit — otherwise this installer keeps accepting stale/mismatched content from
+# whichever of the three fetch channels answers, without ever detecting the drift.
+# Recompute with: certutil -hashfile <file> SHA256   (or `sha256sum <file>` on Linux/macOS)
+$expectedHashes = @{
+    "SwiftSlate.pyw" = "00E0362309AAE110DD3A9E6491184A2A9FE55DBF9C6283274A098A9B6DE5B26F"
+    "commands.json"  = "CE38B3C4B48B56BA40B8BD23C58AE873C3B29D78BD8319FA96CEBB923A478E9A"
+}
+
 # Ensure TLS 1.2+ (older Windows/PowerShell may default to TLS 1.0 which many CDNs reject)
 # Tls13 is not defined on older .NET Framework builds - referencing it there throws,
 # which crashed the installer on exactly the systems this line was meant to help.
@@ -20,7 +30,32 @@ try {
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 }
 
-# --- Helper: download with CDN fallback ---
+function Read-SecureKey {
+    param([string]$Prompt)
+    $sec = Read-Host $Prompt -AsSecureString
+    if (-not $sec) { return "" }
+    $bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec)
+    try {
+        return [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr)
+    } finally {
+        [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+    }
+}
+
+# --- Helper: verify a downloaded file's SHA-256 against the pinned expectation ---
+# Returns $true if the file has no pinned hash (nothing to check) or matches it.
+function Test-FileHash {
+    param([string]$File, [string]$OutFile)
+    $expected = $expectedHashes[$File]
+    if (-not $expected) { return $true }
+    $actual = (Get-FileHash -Path $OutFile -Algorithm SHA256).Hash
+    if ($actual -ieq $expected) { return $true }
+    Write-Host "  [HASH MISMATCH] $File expected $expected got $actual" -ForegroundColor DarkGray
+    Remove-Item $OutFile -Force -EA SilentlyContinue
+    return $false
+}
+
+# --- Helper: download with CDN fallback, verifying integrity against $expectedHashes ---
 function Get-File {
     param([string]$File, [string]$OutFile)
     $urls = @("$repo/$File", "$repoFallback/$File")
@@ -28,7 +63,10 @@ function Get-File {
         try {
             # Try Invoke-WebRequest first (standard approach)
             Invoke-WebRequest -Uri $url -OutFile $OutFile -UseBasicParsing -TimeoutSec 30
-            if (Test-Path $OutFile) { return $true }
+            if ((Test-Path $OutFile) -and (Get-Item $OutFile).Length -gt 0) {
+                if (Test-FileHash $File $OutFile) { return $true }
+                continue
+            }
         } catch {
             $err = $_.Exception.Message
             if ($_.Exception.Response) {
@@ -44,7 +82,10 @@ function Get-File {
     foreach ($url in $urls) {
         try {
             (New-Object Net.WebClient).DownloadFile($url, $OutFile)
-            if (Test-Path $OutFile) { return $true }
+            if ((Test-Path $OutFile) -and (Get-Item $OutFile).Length -gt 0) {
+                if (Test-FileHash $File $OutFile) { return $true }
+                continue
+            }
         } catch {}
     }
     # Last resort: GitHub Contents API (different rate limit pool, returns base64)
@@ -53,7 +94,9 @@ function Get-File {
         if ($resp.content) {
             $bytes = [Convert]::FromBase64String($resp.content)
             [IO.File]::WriteAllBytes($OutFile, $bytes)
-            if (Test-Path $OutFile) { return $true }
+            if ((Test-Path $OutFile) -and (Get-Item $OutFile).Length -gt 0) {
+                if (Test-FileHash $File $OutFile) { return $true }
+            }
         }
     } catch {
         $err = $_.Exception.Message
@@ -61,8 +104,10 @@ function Get-File {
     }
     return $false
 }
-$pythonVersion = "3.12.7"
+$pythonVersion = "3.12.10"
 $pythonZipUrl = "https://www.python.org/ftp/python/$pythonVersion/python-$pythonVersion-embed-amd64.zip"
+# Published by python.org for this exact build. Recompute with `sha256sum` if $pythonVersion changes.
+$pythonZipHash = "4ACBED6DD1C744B0376E3B1CF57CE906F9DC9E95E68824584C8099A63025A3C3"
 
 # --- Helper: kill running SwiftSlate instances ---
 function Stop-SwiftSlate {
@@ -145,6 +190,13 @@ if (-not $pythonwExe) {
         Write-Host "  Failed to download Python. Install Python 3.10+ manually: python.org/downloads" -ForegroundColor Red
         return
     }
+    $zipHash = (Get-FileHash -Path $zipPath -Algorithm SHA256).Hash
+    if ($zipHash -ine $pythonZipHash) {
+        Write-Host "  Python runtime failed integrity check (expected $pythonZipHash, got $zipHash)." -ForegroundColor Red
+        Write-Host "  Install Python 3.10+ manually: python.org/downloads" -ForegroundColor Red
+        Remove-Item $zipPath -Force -EA SilentlyContinue
+        return
+    }
     if (-not (Test-Path $runtimeDir)) { New-Item -ItemType Directory -Path $runtimeDir -Force | Out-Null }
     try { Expand-Archive -Path $zipPath -DestinationPath $runtimeDir -Force } catch {
         Write-Host "  Failed to extract Python runtime." -ForegroundColor Red
@@ -208,7 +260,7 @@ if (-not (Test-Path $configPath)) {
             $provider = "groq"
             Write-Host ""; Write-Host "  Key: https://console.groq.com/keys" -ForegroundColor Yellow
             Write-Host ""
-            $apiKey = Read-Host "  API Key"
+            $apiKey = Read-SecureKey "  API Key"
             Write-Host ""
             Write-Host "  [1] openai/gpt-oss-120b (default)" -ForegroundColor White
             Write-Host "  [2] qwen/qwen3.6-27b (faster)" -ForegroundColor White
@@ -221,7 +273,7 @@ if (-not (Test-Path $configPath)) {
             Write-Host ""
             $endpoint = Read-Host "  Endpoint (e.g. http://localhost:11434/v1)"
             Write-Host ""
-            $apiKey = Read-Host "  API Key (Enter to skip)"
+            $apiKey = Read-SecureKey "  API Key (Enter to skip)"
             if ([string]::IsNullOrWhiteSpace($apiKey)) { $apiKey = "none" }
             Write-Host ""
             $model = Read-Host "  Model name"
@@ -231,7 +283,7 @@ if (-not (Test-Path $configPath)) {
             $provider = "gemini"
             Write-Host ""; Write-Host "  Key: https://aistudio.google.com/api-keys" -ForegroundColor Yellow
             Write-Host ""
-            $apiKey = Read-Host "  API Key"
+            $apiKey = Read-SecureKey "  API Key"
             Write-Host ""
             Write-Host "  [1] gemini-3.5-flash-lite (default)" -ForegroundColor White
             Write-Host "  [2] gemini-3.6-flash" -ForegroundColor White

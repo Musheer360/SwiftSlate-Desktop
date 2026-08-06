@@ -96,7 +96,7 @@ Add multiple API keys for automatic round-robin rotation. If one key hits a rate
 Ships with Google Gemini, Groq, or connect **any OpenAI-compatible endpoint** — cloud providers, or **local LLMs** like [Ollama](https://ollama.com), [LM Studio](https://lmstudio.ai), and others running locally.
 
 ### 🛠️ Two Command Types
-**AI commands** send text to your provider for intelligent transformation. **Text replacer commands** run entirely offline for instant local text manipulation — no API key needed.
+**AI commands** send text to your provider for intelligent transformation. **Text replacer commands** run locally and need no API key, except `?ip`, which performs a public-IP lookup.
 
 ### 🔄 Hot Reload
 Edit your config or commands file and changes apply within 2 seconds — no restart needed.
@@ -139,7 +139,7 @@ Run the same command again to **update** or **uninstall**.
 
 ## 🧩 Built-in Commands
 
-SwiftSlate ships with **10 AI-powered commands**, dynamic translation, and **clipboard commands** — ready to use out of the box:
+SwiftSlate ships with **9 AI-powered commands**, dynamic translation, **3 built-in shell replacers** (`?date`, `?time`, `?ip`), and **clipboard commands** — ready to use out of the box:
 
 | Trigger | Action | Example |
 |:--------|:-------|:--------|
@@ -161,7 +161,7 @@ SwiftSlate ships with **10 AI-powered commands**, dynamic translation, and **cli
 |:--------|:-------|
 | **`?date`** | Today's date |
 | **`?time`** | Current time |
-| **`?ip`** | Public IP address |
+| **`?ip`** | Public IP address (queries ifconfig.me) |
 
 ### Clipboard Commands
 
@@ -169,8 +169,8 @@ SwiftSlate ships with **10 AI-powered commands**, dynamic translation, and **cli
 |:--------|:-------|
 | **`?copy`** | Copy preceding text to internal clipboard |
 | **`?cut`** | Cut preceding text |
-| **`?paste`** | Paste after existing text |
-| **`?replace`** | Replace all text with clipboard content |
+| **`?paste`** | Paste after existing text (falls back to system clipboard if internal stack is empty) |
+| **`?replace`** | Replace all text with clipboard content (falls back to system clipboard if internal stack is empty) |
 
 <br>
 
@@ -178,7 +178,7 @@ SwiftSlate ships with **10 AI-powered commands**, dynamic translation, and **cli
 
 | Provider | Recommended Models | Notes |
 |:---------|:-------|:------|
-| **Google Gemini** (default) | `gemini-3.5-flash-lite` (default), `gemini-3.6-flash` | Free tier at [aistudio.google.com](https://aistudio.google.com/api-keys). Thinking level set to `minimal` for fast inline transforms. |
+| **Google Gemini** (default) | `gemini-3.5-flash-lite` (default), `gemini-3.6-flash` | Free tier at [aistudio.google.com](https://aistudio.google.com/api-keys). Thinking level set per model for fast inline transforms. |
 | **Groq** | `openai/gpt-oss-120b` (default), `qwen/qwen3.6-27b` | Free tier at [console.groq.com](https://console.groq.com/keys). Per-model reasoning params applied automatically. |
 | **Custom (OpenAI-compatible)** | Any model your endpoint supports | Works with Ollama, LM Studio, vLLM, any `/v1/chat/completions` endpoint |
 
@@ -323,12 +323,14 @@ This runs in the foreground with full logging — shows every keystroke match, A
 
 | | Concern | How SwiftSlate Desktop Handles It |
 |:--|:--------|:------------------------|
-| 👁️ | **Text Monitoring** | Only processes text when a trigger command is detected at the end of the keystroke buffer. All other typing is completely ignored. |
-| 📡 | **Data Transmission** | Text is sent **only** to the configured AI provider (Google Gemini, Groq, or your custom endpoint). No other servers are ever contacted. Text replacer commands never leave your machine. |
+| 👁️ | **Text Monitoring** | Raw Input transiently inspects a bounded keystroke suffix to detect configured triggers. Non-trigger text is not logged, persisted, or transmitted. |
+| 📡 | **Data Transmission** | AI-command text is sent only to the configured AI provider (Google Gemini, Groq, or your custom endpoint). No user text or API keys are sent to other servers. A bare TCP connect to public DNS on port 443 checks connectivity after a network error; `?ip` separately contacts ifconfig.me to look up your public IP. |
+| 🔐 | **API Key Storage** | API keys are stored locally in `config.json` so the app can use your configured provider. Setup prompts use secure string input to avoid terminal history leaks. Protect your Windows account and do not share this file. |
 | 📊 | **Analytics** | **None.** Zero telemetry, zero tracking, zero crash reporting. |
 | 📖 | **Open Source** | The entire codebase is open for inspection under the MIT License. |
 | 🔑 | **Permissions** | Runs as a standard user process — no admin/elevated privileges required. |
-| 📋 | **Clipboard Safety** | All clipboard operations use Windows exclusion flags to prevent pollution of clipboard history and cloud sync. |
+| 📋 | **Clipboard Safety** | SwiftSlate marks clipboard data it writes to avoid history/cloud sync where Windows honors those flags. Reading an active field requires Windows copy/paste automation, so sensitive fields may still be handled by the target app's normal clipboard path. |
+| ✅ | **Installer Integrity** | `install.ps1` verifies the SHA-256 of `SwiftSlate.pyw`, `commands.json`, and the embedded Python runtime against hashes pinned in the script before installing them, across every download channel (GitHub raw, jsDelivr, GitHub API). A mismatch is rejected rather than installed. |
 
 <br>
 

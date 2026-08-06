@@ -13,6 +13,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import http.client
@@ -75,6 +76,8 @@ user32.RegisterClipboardFormatW.argtypes = [wt.LPCWSTR]
 user32.RegisterClipboardFormatW.restype = wt.UINT
 user32.GetClipboardSequenceNumber.argtypes = []
 user32.GetClipboardSequenceNumber.restype = wt.DWORD
+user32.GetClipboardOwner.argtypes = []
+user32.GetClipboardOwner.restype = wt.HWND
 # -- Memory --
 kernel32.GlobalAlloc.argtypes = [wt.UINT, ctypes.c_size_t]
 kernel32.GlobalAlloc.restype = wt.HANDLE
@@ -237,9 +240,13 @@ def strip_markdown_fences(text):
         lines = result.split("\n")
         if lines and lines[0].startswith("```"):
             lines = lines[1:]
+        while lines and not lines[-1].strip():
+            lines.pop()
         if lines and lines[-1].startswith("```"):
             lines = lines[:-1]
-        result = "\n".join(lines).strip()
+        stripped = "\n".join(lines).strip()
+        if stripped:
+            return stripped
     return result
 
 # Model catalog — per-model reasoning/thinking parameters (mirrors Android's
@@ -270,6 +277,10 @@ key_state = (ctypes.c_ubyte * 256)()
 char_buffer = ctypes.create_unicode_buffer(4)
 keystroke_buffer = collections.deque(maxlen=128)
 max_buffer_len = 128
+MAX_FIELD_CHARS = 100_000
+MAX_COMMANDS = 256
+MAX_TRIGGER_CHARS = 64
+MAX_REPLACER_OUTPUT_BYTES = 65_536
 last_fg_hwnd = 0  # Track foreground window for buffer clearing
 last_keystroke_time = 0.0  # Timestamp of last keystroke for idle gap detection
 BUFFER_IDLE_TIMEOUT = 2.5  # Seconds of silence before clearing buffer (catches mouse-click field switches)
@@ -340,8 +351,8 @@ def notify(title, message, icon=NIIF_INFO):
             mb_icon = 0x10 if icon == NIIF_ERROR else 0x30
             try:
                 user32.MessageBoxW(None, message, title, mb_icon)
-            except Exception:
-                pass
+            except Exception as mb_err:
+                log(f"MessageBox fallback failed: {mb_err}")
         return
     try:
         _ensure_notify_icon()
@@ -401,7 +412,7 @@ def _notify_debounced(message, icon=NIIF_INFO):
 # --- Load config ---
 def load_config():
     global config, commands, api_keys, model, prefix, translate_prefix
-    global trigger_strings, trigger_last_chars, max_buffer_len
+    global trigger_strings, trigger_last_chars, max_buffer_len, keystroke_buffer
     global provider, temperature, custom_endpoint, key_delay, spinner_mode
 
     config_path = os.path.join(script_dir, "config.json")
@@ -417,12 +428,12 @@ def load_config():
         with open(config_path, "r", encoding="utf-8-sig") as f:
             config = json.load(f)
     except (json.JSONDecodeError, ValueError) as e:
-        log(f"ERROR: config.json is malformed: {e}")
+        log(f"ERROR: config.json parse error: {e}")
         notify("SwiftSlate", f"config.json parse error: {e}", NIIF_ERROR)
         return False
-    except (OSError, IOError) as e:
+    except OSError as e:
         log(f"ERROR: Cannot read config.json: {e}")
-        notify("SwiftSlate", "Cannot read config.json.", NIIF_ERROR)
+        notify("SwiftSlate", f"Cannot read config.json: {e}", NIIF_ERROR)
         return False
 
     # Validate the keys BEFORE publishing anything into the globals. This was the only
@@ -508,7 +519,7 @@ def load_config():
         provider = "gemini"
 
     if provider == "custom" and custom_endpoint and not custom_endpoint.startswith(("http://", "https://")):
-        log(f"WARNING: Custom endpoint must start with http:// or https://")
+        log("WARNING: Custom endpoint must start with http:// or https://")
         notify("SwiftSlate", "Custom endpoint URL is invalid - falling back to Gemini.", NIIF_ERROR)
         provider = "gemini"
 
@@ -549,24 +560,33 @@ def load_config():
             if not isinstance(cmd_list, list):
                 log("WARNING: commands.json must contain a list, ignoring")
                 cmd_list = []
-            for cmd in cmd_list:
+            for cmd in cmd_list[:MAX_COMMANDS]:
                 if not isinstance(cmd, dict) or "trigger" not in cmd:
                     continue  # Skip malformed entries
                 trigger = cmd["trigger"]
-                if not isinstance(trigger, str) or not trigger.strip():
+                if not isinstance(trigger, str) or not trigger.strip() or len(trigger) > MAX_TRIGGER_CHARS:
+                    log("WARNING: Ignoring command with invalid trigger")
                     continue
                 if trigger in new_commands:
                     log(f"WARNING: Duplicate trigger '{trigger}' in commands.json (overwritten)")
                 cmd_type = cmd.get("type", "ai")
+                if cmd_type not in ("ai", "replacer-text", "replacer-shell"):
+                    log(f"WARNING: Ignoring '{trigger}' with unsupported command type")
+                    continue
+                prompt = cmd.get("prompt", "")
+                value = cmd.get("value", "")
+                if not isinstance(prompt, str) or not isinstance(value, str):
+                    log(f"WARNING: Ignoring '{trigger}' with non-text prompt or value")
+                    continue
                 new_commands[trigger] = {
                     "type": cmd_type,
-                    "prompt": cmd.get("prompt", ""),
-                    "value": cmd.get("value", ""),
+                    "prompt": prompt,
+                    "value": value,
                 }
         except (json.JSONDecodeError, ValueError) as e:
             log(f"WARNING: commands.json parse error: {e}")
             notify("SwiftSlate", f"commands.json parse error: {e}", NIIF_WARNING)
-        except (OSError, IOError) as e:
+        except OSError as e:
             log(f"WARNING: Cannot read commands.json: {e}")
 
     # System commands
@@ -596,6 +616,7 @@ def load_config():
     longest_trigger = max((len(f) for f in new_trigger_strings.values()), default=20)
     translate_len = len(translate_prefix) + 5  # ?translate:XXXXX
     max_buffer_len = max(longest_trigger, translate_len) + 5
+    keystroke_buffer = collections.deque(keystroke_buffer, maxlen=max_buffer_len)
 
     log(f"Config loaded: model={model}, prefix={prefix}, keys={len(api_keys)}, key_delay={key_delay_ms}ms")
     log(f"Commands loaded: {len(commands)}")
@@ -722,6 +743,15 @@ def _redact_secrets(text):
     and provider text is surfaced in tray balloons."""
     return re.sub(r"(?:sk-|gsk_|AIza|xai-|sk-ant-)[A-Za-z0-9_\-]{6,}", "***", text or "")
 
+MAX_RESPONSE_BYTES = 1_048_576
+
+def _read_response_bounded(response):
+    """Read an API response with a hard limit, matching Android's 1 MiB guard."""
+    data = response.read(MAX_RESPONSE_BYTES + 1)
+    if len(data) > MAX_RESPONSE_BYTES:
+        raise ApiResponseError("Provider response was too large. Try again.")
+    return data
+
 # --- Error classification ---
 ERR_RATE_LIMIT = "rate_limit"
 ERR_INVALID_KEY = "invalid_key"
@@ -758,25 +788,6 @@ def _parse_api_error(body):
     except Exception:
         return "", ""
 
-# Optional tuning params SwiftSlate may send. Both providers name the offending property
-# in the message (verified against the live Groq API):
-#   "'reasoning_effort' : value is not one of the allowed values ['none',...]"
-#   "`reasoning_effort` must be one of `none` or `default`"
-#   "property 'thinkingLevel' is unsupported"
-# so a genuinely stale tuning spec can be told apart from an unrelated 400.
-_TUNING_PARAM_NAMES = ("reasoning_effort", "include_reasoning", "max_completion_tokens",
-                       "thinkingLevel", "thinkingConfig")
-
-def _named_tuning_param(message):
-    """The tuning param `message` names, or None if it names none of them."""
-    if not message:
-        return None
-    lower = message.lower()
-    for name in _TUNING_PARAM_NAMES:
-        if name.lower() in lower:
-            return name
-    return None
-
 def classify_error(e, http_code=None):
     """Classify an error for retry decisions."""
     if http_code == 429:
@@ -786,10 +797,7 @@ def classify_error(e, http_code=None):
     if http_code is not None and 500 <= http_code <= 599:
         return ERR_SERVER
     # HTTPError MUST be tested before URLError/OSError: HTTPError subclasses both, so
-    # the broader isinstance() below would classify every HTTP status as a network
-    # error. That made ERR_OTHER unreachable for HTTP failures, which in turn meant
-    # the 400/422 graceful-degradation retry in call_api() could never fire and
-    # _call_degraded() was dead code.
+    # the broader isinstance() below would classify every HTTP status as a network error.
     if isinstance(e, urllib.error.HTTPError):
         if e.code == 429:
             return ERR_RATE_LIMIT
@@ -813,7 +821,7 @@ def _check_network():
             sock = socket.create_connection((host, 443), timeout=1.5)
             sock.close()
             return True
-        except (OSError, socket.timeout):
+        except (TimeoutError, OSError):
             continue
     return False
 
@@ -824,24 +832,38 @@ def is_model_refusal(text: str) -> bool:
     if not text:
         return False
     head = text.strip()[:200].lower().replace("’", "'").replace("‘", "'")
+    # Keep this list in sync with Android ApiClientUtils. Each signature is specific
+    # to a refusal so ordinary text about an AI, policy, or safety is never discarded.
     signatures = [
-        "can't help with that", "cannot help with that",
-        "can't comply with", "cannot comply with",
-        "cannot fulfill the request", "cannot fulfill this request", "cannot fulfill your request",
-        "unable to fulfill the request", "unable to fulfill your request",
-        "as an ai", "as an assistant",
-        "safety guidelines", "safety policy", "helpful and harmless",
-        "violates our policy", "violates safety"
+        "i can't help with that", "i cannot help with that",
+        "i can't help you with that", "i cannot help you with that",
+        "i can't assist with that", "i cannot assist with that",
+        "i can't comply", "i cannot comply",
+        "i can't generate that", "i cannot generate that",
+        "i won't be able to help with that",
+        "i'm unable to help with that", "i am unable to help with that",
+        "i'm not able to help with that", "i am not able to help with that",
+        "can't fulfill the request", "cannot fulfill the request",
+        "can't fulfill this request", "cannot fulfill this request",
+        "can't fulfill your request", "cannot fulfill your request",
+        "unable to fulfill the request", "unable to fulfill this request",
+        "unable to fulfill your request",
+        "as an ai,", "as an ai language model", "as an ai assistant",
+        "violates safety guidelines", "violates our safety",
+        "violates our content polic", "violates our usage polic",
+        "against our safety guidelines", "against my safety guidelines",
+        "goes against my guidelines",
     ]
-    lower = text.lower()
-    return any(sig in head for sig in signatures) or "safety guidelines" in lower or "violates our policy" in lower
+    return any(sig in head for sig in signatures)
 
 def call_api(text, prompt):
     """Call API with key rotation and retry on transient errors.
     On network/timeout failures, checks connectivity first before retrying.
     Returns (result_text, error_reason) — one will be None."""
     system_content = SYSTEM_PROMPT_PREFIX + prompt
-    max_attempts = max(len(api_keys), 1)
+    # A bounded retry budget keeps a hung/misconfigured key set from retaining the
+    # exclusive operation lock indefinitely.
+    max_attempts = min(max(len(api_keys), 1), 3)
     last_error = None
     failure_reason = None
 
@@ -853,9 +875,12 @@ def call_api(text, prompt):
             if not api_keys:
                 failure_reason = "No API keys configured. Add one to config.json."
             elif sum(1 for k in api_keys if _is_key_invalid(k)) >= len(api_keys):
-                if len(api_keys) > 1 and key:
-                    hint = f"••••{key[-4:]}" if len(key) >= 4 else "key"
-                    failure_reason = f"All API keys were rejected by the provider ({hint}). Check your keys in config.json."
+                if len(tried_keys) > 1:
+                    failure_reason = f"All {len(tried_keys)} API keys were rejected by the provider. Check your keys in config.json."
+                elif tried_keys:
+                    last_tried = list(tried_keys)[-1]
+                    hint = f"••••{last_tried[-4:]}" if len(last_tried) >= 4 else "key"
+                    failure_reason = f"API key was rejected by the provider ({hint}). Check your key in config.json."
                 else:
                     failure_reason = ("All API keys were rejected by the provider. Check your keys, and "
                                       f"that '{model}' is available to them.")
@@ -897,9 +922,9 @@ def call_api(text, prompt):
 
             err_body = ""
             try:
-                err_body = e.read().decode("utf-8", "replace")
-            except Exception:
-                pass
+                err_body = e.read(65_537).decode("utf-8", "replace")[:65_536]
+            except Exception as read_err:
+                log(f"Failed to read error body: {read_err}")
             err_code, err_msg = _parse_api_error(err_body)
             detail = err_msg or err_body[:200]
 
@@ -929,8 +954,8 @@ def call_api(text, prompt):
                     ra = e.headers.get("Retry-After")
                     if ra and ra.isdigit():
                         retry_after = int(ra)
-                except Exception:
-                    pass
+                except Exception as parse_err:
+                    log(f"Failed to parse Retry-After header: {parse_err}")
                 report_rate_limit(key, retry_after)
                 failure_reason = "All API keys are rate limited. Wait a moment and try again."
                 continue  # Try next key
@@ -1032,9 +1057,9 @@ def _call_gemini(text, system_content, key):
     # Let exceptions propagate to call_api retry loop
     with urllib.request.urlopen(req, timeout=45) as resp:
         try:
-            data = json.loads(resp.read().decode("utf-8"))
-        except (ValueError, UnicodeDecodeError):
-            raise ApiResponseError("Provider returned an unreadable response. Try again.")
+            data = json.loads(_read_response_bounded(resp).decode("utf-8"))
+        except (ValueError, UnicodeDecodeError) as parse_err:
+            raise ApiResponseError("Provider returned an unreadable response. Try again.") from parse_err
         if not isinstance(data, dict):
             raise ApiResponseError("Provider returned an unexpected response. Try again.")
         try:
@@ -1042,8 +1067,8 @@ def _call_gemini(text, system_content, key):
             first = candidates[0] if candidates else None
             if candidates and not isinstance(first, dict):
                 raise ApiResponseError("Provider returned an unreadable response. Try again.")
-        except (AttributeError, TypeError, IndexError):
-            raise ApiResponseError("Provider returned an unreadable response. Try again.")
+        except (AttributeError, TypeError, IndexError) as parse_err:
+            raise ApiResponseError("Provider returned an unreadable response. Try again.") from parse_err
         if candidates:
             try:
                 finish = candidates[0].get("finishReason", "")
@@ -1055,8 +1080,8 @@ def _call_gemini(text, system_content, key):
                 result = (parts[0].get("text") or "").strip() if parts else ""
             except ApiResponseError:
                 raise
-            except (AttributeError, TypeError, KeyError, IndexError):
-                raise ApiResponseError("Provider returned an unreadable response. Try again.")
+            except (AttributeError, TypeError, KeyError, IndexError) as parse_err:
+                raise ApiResponseError("Provider returned an unreadable response. Try again.") from parse_err
             if not parts:
                 raise ApiResponseError("Model returned no content. Try again.")
             if not result:
@@ -1104,9 +1129,9 @@ def _call_openai_compatible(text, system_content, key, endpoint):
     # Let exceptions propagate to call_api retry loop
     with urllib.request.urlopen(req, timeout=45) as resp:
         try:
-            data = json.loads(resp.read().decode("utf-8"))
-        except (ValueError, UnicodeDecodeError):
-            raise ApiResponseError("Provider returned an unreadable response. Try again.")
+            data = json.loads(_read_response_bounded(resp).decode("utf-8"))
+        except (ValueError, UnicodeDecodeError) as parse_err:
+            raise ApiResponseError("Provider returned an unreadable response. Try again.") from parse_err
         if not isinstance(data, dict):
             raise ApiResponseError("Provider returned an unexpected response. Try again.")
         try:
@@ -1126,9 +1151,9 @@ def _call_openai_compatible(text, system_content, key, endpoint):
             return cleaned
         except ApiResponseError:
             raise
-        except (KeyError, IndexError, TypeError, AttributeError):
+        except (KeyError, IndexError, TypeError, AttributeError) as parse_err:
             log(f"Malformed API response: {list(data.keys())}")
-            raise ApiResponseError("Provider returned an unreadable response. Try again.")
+            raise ApiResponseError("Provider returned an unreadable response. Try again.") from parse_err
 
 # --- Clipboard (silent, no history pollution) ---
 def set_clipboard_silent(text):
@@ -1140,7 +1165,8 @@ def set_clipboard_silent(text):
     if not user32.OpenClipboard(owner):
         return False
     try:
-        user32.EmptyClipboard()
+        if not user32.EmptyClipboard():
+            return False
         # Set text as CF_UNICODETEXT
         data = (text + "\0").encode("utf-16-le")
         hmem = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(data))
@@ -1275,9 +1301,11 @@ def send_keys(keys):
                 log(f"SendInput: only {sent}/4 events injected (UIPI or blocked)")
             time.sleep(0.01)
 
-def _replace_last_char(ch):
+def _replace_last_char(ch, expected_hwnd):
     """Replace the last character in the focused field using Shift+Left + Unicode input.
     No clipboard needed, no selection flash. All events sent atomically."""
+    if user32.GetForegroundWindow() != expected_hwnd or _user_modifiers_down():
+        return False
     code = ord(ch)
     inp = INPUT()
     inp.type = INPUT_KEYBOARD
@@ -1428,6 +1456,10 @@ def do_transform(trigger_name, prompt):
             # simply broken; the sibling workers already notify for the same condition.
             _notify_debounced("Could not read the text in this field.", NIIF_WARNING)
             return
+        if len(full_text) > MAX_FIELD_CHARS:
+            log(f"Input rejected: {len(full_text)} chars exceeds {MAX_FIELD_CHARS}")
+            _notify_debounced("Text is too long to transform. Select less text and try again.", NIIF_WARNING)
+            return
 
         # Record clipboard sequence at grab time — only restore prev_clip if
         # nobody else has written to the clipboard since then.
@@ -1474,7 +1506,6 @@ def do_transform(trigger_name, prompt):
         # to predictable behavior on slow machines or machines under load.
         SPINNER_INTERVAL = key_delay
         frame = 0
-        window_changed = False
         aborted = False
         timed_out = False
         # abort_event is cleared in handle_trigger (before processing starts),
@@ -1493,12 +1524,12 @@ def do_transform(trigger_name, prompt):
                 spinner_text = input_text + " [Processing...]"
             else:
                 spinner_text = input_text + " " + spinner_frames[0]
-            seq_before = user32.GetClipboardSequenceNumber()
             if set_clipboard_silent(spinner_text):
                 seq_after = user32.GetClipboardSequenceNumber()
                 # Verify clipboard is still ours (not stolen by another app)
                 time.sleep(0.01)
-                if user32.GetClipboardSequenceNumber() == seq_after:
+                if user32.GetClipboardSequenceNumber() == seq_after and user32.GetForegroundWindow() == hwnd \
+                        and not _user_modifiers_down():
                     # Paste only (Ctrl+V) — text is already selected
                     inputs_paste = (INPUT * 4)(
                         _make_key(VK_CONTROL),
@@ -1539,7 +1570,6 @@ def do_transform(trigger_name, prompt):
                 # CRITICAL: never inject keystrokes here. SendInput targets the
                 # NEW foreground window and would overwrite its content.
                 log("Window changed, waiting silently")
-                window_changed = True
                 done_event.wait(timeout=MAX_SPINNER_SECONDS)
                 break
 
@@ -1554,7 +1584,7 @@ def do_transform(trigger_name, prompt):
                         # User is holding Ctrl/Shift/Alt/Win. Injecting Shift+Left
                         # now would merge into an unintended combo. Skip this frame.
                         pass
-                    elif _replace_last_char(spinner_frames[frame % 4]):
+                    elif _replace_last_char(spinner_frames[frame % 4], hwnd):
                         frame += 1
                         last_frame_time = now
                     else:
@@ -1571,18 +1601,18 @@ def do_transform(trigger_name, prompt):
         log(f"Result: {len(result) if result else 0} chars")
 
         if timed_out:
-            # API took too long or paste kept failing — restore the original text
-            log("Timed out — restoring original text")
-            _notify_debounced("Transform timed out. Try again.", NIIF_WARNING)
-            if spinner_active and user32.GetForegroundWindow() == hwnd:
-                _retry_paste(input_text)
+            # Keep the operation exclusive until its bounded network worker has actually
+            # returned. Retrying another transform meanwhile wastes keys and can race results.
+            log("Spinner timed out — waiting for in-flight API worker without further injection")
+            _notify_debounced("Transform is still finishing; new transforms are paused.", NIIF_WARNING)
+            done_event.wait()
             prev_clip = None
         elif aborted:
-            # User started typing — restore original text (remove spinner char)
-            if spinner_active and user32.GetForegroundWindow() == hwnd:
-                paste_text(input_text)
+            # Never overwrite a field after the user has resumed typing. A spinner glyph may
+            # remain, but preserving the user's actual keystrokes is more important.
+            log("User input preserved; no field restoration after abort")
             # Wait for API result silently, put on clipboard so user can paste
-            done_event.wait(timeout=30)
+            done_event.wait()
             result = result_holder[0]
             if result:
                 # Don't claim the clipboard holds the result unless the write succeeded.
@@ -1638,7 +1668,7 @@ def do_transform(trigger_name, prompt):
         if prev_clip is not None:
             current_seq = user32.GetClipboardSequenceNumber()
             # Allow up to 4 sequence bumps from our own operations (clear + spinner + result + restore)
-            if (current_seq - clip_seq_at_grab) <= 4:
+            if user32.GetClipboardOwner() == hwnd_main and (current_seq - clip_seq_at_grab) <= 4:
                 set_clipboard_silent(prev_clip)
             else:
                 log("Clipboard changed externally — skipping restoration")
@@ -1732,23 +1762,30 @@ def do_clipboard_command(command):
                 # Never claim the text was cut while it is still sitting in the field.
                 log("Cut failed: could not update the field")
                 _notify_debounced(f"{prefix}cut failed.", NIIF_ERROR)
-        elif command == "paste" and internal_clipboard:
-            if paste_text(text_before + internal_clipboard):
-                log("Pasted")
+        elif command == "paste":
+            clip_text = internal_clipboard if internal_clipboard else get_clipboard_text()
+            if clip_text:
+                if paste_text(text_before + clip_text):
+                    log("Pasted")
+                else:
+                    log("Paste failed")
+                    _notify_debounced(f"{prefix}paste failed.", NIIF_ERROR)
             else:
-                log("Paste failed")
-                _notify_debounced(f"{prefix}paste failed.", NIIF_ERROR)
-        elif command == "replace" and internal_clipboard:
-            if paste_text(internal_clipboard):
-                log("Replaced")
+                paste_text(text_before)
+                log("Nothing to paste")
+                _notify_debounced("Clipboard is empty.", NIIF_INFO)
+        elif command == "replace":
+            clip_text = internal_clipboard if internal_clipboard else get_clipboard_text()
+            if clip_text:
+                if paste_text(clip_text):
+                    log("Replaced")
+                else:
+                    log("Replace failed")
+                    _notify_debounced(f"{prefix}replace failed.", NIIF_ERROR)
             else:
-                log("Replace failed")
-                _notify_debounced(f"{prefix}replace failed.", NIIF_ERROR)
-        else:
-            # No internal clipboard - restore field without trigger
-            paste_text(text_before)
-            log(f"Nothing to {command}")
-            _notify_debounced(f"Nothing copied yet - use {prefix}copy or {prefix}cut first.", NIIF_INFO)
+                paste_text(text_before)
+                log("Nothing to replace")
+                _notify_debounced("Clipboard is empty.", NIIF_INFO)
 
         time.sleep(0.2)
         if prev_clip:
@@ -1799,14 +1836,31 @@ def do_replacer(trigger_name, cmd_type, value):
             replacement = value
         elif cmd_type == "replacer-shell":
             try:
-                proc = subprocess.run(
-                    value, shell=True, capture_output=True, text=True,
-                    timeout=3, creationflags=subprocess.CREATE_NO_WINDOW
-                )
-                replacement = proc.stdout.strip()
+                # Capture to files, not pipes: a fast/malicious command must not exhaust
+                # the resident process memory before the timeout fires.
+                with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+                    proc = subprocess.Popen(
+                        value, shell=True, stdout=stdout, stderr=stderr,
+                        creationflags=subprocess.CREATE_NO_WINDOW,
+                    )
+                    try:
+                        proc.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait()
+                        raise
+                    stdout.seek(0, os.SEEK_END)
+                    output_size = stdout.tell()
+                    stdout.seek(0)
+                    stderr.seek(0)
+                    if output_size > MAX_REPLACER_OUTPUT_BYTES:
+                        shell_error = f"command output exceeded {MAX_REPLACER_OUTPUT_BYTES} bytes"
+                    else:
+                        replacement = stdout.read().decode("utf-8", "replace").strip()
+                    error_text = stderr.read(MAX_REPLACER_OUTPUT_BYTES).decode("utf-8", "replace").strip()
                 if not replacement:
                     # Distinguish "ran, produced nothing" from a crash: stderr/returncode say which.
-                    shell_error = (proc.stderr or "").strip()[:120] or f"command produced no output (exit {proc.returncode})"
+                    shell_error = shell_error or error_text[:120] or f"command produced no output (exit {proc.returncode})"
             except subprocess.TimeoutExpired:
                 log("Shell command timed out (3s)")
                 shell_error = "command timed out after 3s"
@@ -1816,8 +1870,11 @@ def do_replacer(trigger_name, cmd_type, value):
 
         if replacement:
             if abort_event.is_set():
-                log("Replacer: user typed during execution, skipping paste")
-                paste_text(before.rstrip() if before else (full_text or ""))
+                log("Replacer: user typed during execution; preserving field and copying result")
+                if set_clipboard_silent(replacement):
+                    _notify_debounced("You kept typing - replacement copied to clipboard instead.", NIIF_INFO)
+                else:
+                    _notify_debounced("You kept typing; replacement could not be saved.", NIIF_ERROR)
             else:
                 paste_text(before + replacement)
                 log(f"Replaced with: {len(replacement)} chars")
@@ -1878,8 +1935,6 @@ def handle_trigger(trigger_name):
 
 # --- Raw Input keystroke processing ---
 def process_keystroke(vkey, scan_code):
-    global keystroke_buffer, last_fg_hwnd, last_keystroke_time
-
     try:
         _process_keystroke_inner(vkey, scan_code)
     except Exception as e:
@@ -1887,7 +1942,7 @@ def process_keystroke(vkey, scan_code):
         keystroke_buffer.clear()
 
 def _process_keystroke_inner(vkey, scan_code):
-    global keystroke_buffer, last_fg_hwnd, last_keystroke_time
+    global last_fg_hwnd, last_keystroke_time
 
     # Clear buffer on window change (prevents cross-app trigger firing)
     current_fg = user32.GetForegroundWindow()
@@ -2008,7 +2063,6 @@ def _process_keystroke_inner(vkey, scan_code):
 
 # --- Window procedure ---
 def wnd_proc(hwnd, msg, wparam, lparam):
-    global hwnd_main
 
     try:
         if msg == WM_INPUT:
@@ -2045,7 +2099,7 @@ def acquire_singleton():
         _mutex_handle = open(lock_path, "w")
         msvcrt.locking(_mutex_handle.fileno(), msvcrt.LK_NBLCK, 1)
         return True
-    except (OSError, IOError):
+    except OSError:
         if _mutex_handle:
             _mutex_handle.close()
             _mutex_handle = None
