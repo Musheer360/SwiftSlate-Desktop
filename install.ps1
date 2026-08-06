@@ -17,7 +17,7 @@ $repoApi = "https://api.github.com/repos/Musheer360/SwiftSlate-Desktop/contents"
 # whichever of the three fetch channels answers, without ever detecting the drift.
 # Recompute with: certutil -hashfile <file> SHA256   (or `sha256sum <file>` on Linux/macOS)
 $expectedHashes = @{
-    "SwiftSlate.pyw" = "00E0362309AAE110DD3A9E6491184A2A9FE55DBF9C6283274A098A9B6DE5B26F"
+    "SwiftSlate.pyw" = "CA3481EAC54D3AE95A9E33B501EDF0F7525B16036FF51AEECCD2D5B649D43CC8"
     "commands.json"  = "CE38B3C4B48B56BA40B8BD23C58AE873C3B29D78BD8319FA96CEBB923A478E9A"
 }
 
