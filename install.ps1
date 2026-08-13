@@ -46,13 +46,13 @@ function Get-File {
             Invoke-WebRequest -Uri $url -OutFile $OutFile -UseBasicParsing -TimeoutSec 30
             $actual = (Get-FileHash -Path $OutFile -Algorithm SHA256).Hash
             if ($actual -ieq $hashes[$Name]) { return }
-            Write-Host "  [BAD HASH] $url served unexpected content" -ForegroundColor DarkGray
+            Write-Host "  [BAD HASH] $url (expected $($hashes[$Name]), got $actual)" -ForegroundColor DarkGray
         } catch {
             Write-Host "  [ERR] $url - $($_.Exception.Message)" -ForegroundColor DarkGray
         }
         Remove-Item $OutFile -Force -EA SilentlyContinue
     }
-    throw "Could not download $Name from any source (network failure or failed integrity check). Check your internet connection, proxy/VPN, or antivirus, then run this command again."
+    throw "Could not download $Name from any source (network failure or failed integrity check). Check your internet connection, proxy/VPN, or antivirus, then run this command again. If the message above says BAD HASH, the CDN is mid-update - wait a minute and re-run."
 }
 
 # --- Stop running SwiftSlate instances and wait for them to exit ---
