@@ -38,10 +38,10 @@ try {
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 }
 
-# --- Download a file (jsDelivr first, GitHub raw fallback), verifying its SHA-256 ---
+# --- Download a file (GitHub raw first, jsDelivr fallback), verifying its SHA-256 ---
 function Get-File {
     param([string]$Name, [string]$OutFile)
-    $urls = @("$repoCdn/$Name", "$repoRaw/$Name")
+    $urls = @("$repoRaw/$Name", "$repoCdn/$Name")
     foreach ($url in $urls) {
         try {
             Invoke-WebRequest -Uri $url -OutFile $OutFile -UseBasicParsing -TimeoutSec 30
@@ -322,6 +322,24 @@ try {
             Write-Host ""
             return
         }
+
+        # --- Spinner & timing ---
+        Write-Host ""
+        Write-Host "  Spinner speed (how fast text animates while processing):" -ForegroundColor DarkGray
+        Write-Host "  [1] Fast (100ms, high-end PC)" -ForegroundColor White
+        Write-Host "  [2] Normal (200ms, recommended)" -ForegroundColor White
+        Write-Host "  [3] Slow (300ms, older machines)" -ForegroundColor White
+        Write-Host "  [4] Static [Processing...] (safest, no animation)" -ForegroundColor White
+        Write-Host ""
+        $sp = Read-Host "  Choice [default: 2]"
+        $keyDelay = 200
+        $spinner = "animated"
+        if ($sp -eq "1") { $keyDelay = 100 }
+        elseif ($sp -eq "3") { $keyDelay = 300 }
+        elseif ($sp -eq "4") { $keyDelay = 200; $spinner = "static" }
+        $cfg.key_delay = $keyDelay
+        $cfg.spinner = $spinner
+
         [IO.File]::WriteAllText($configPath, ($cfg | ConvertTo-Json), (New-Object Text.UTF8Encoding $false))
     }
 
