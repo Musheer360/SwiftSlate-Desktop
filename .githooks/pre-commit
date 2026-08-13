@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Auto-syncs the pinned SHA-256 hashes in install.ps1 whenever SwiftSlate.pyw
+# or commands.json changes, so the pin is always correct at commit time.
+# CI re-verifies the same pins after every push (belt and suspenders).
+set -uo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root"
+
+updated=0
+for f in SwiftSlate.pyw commands.json; do
+  actual=$(sha256sum "$f" | awk '{print toupper($1)}')
+  pinned=$(grep -oP "\"$f\"\s*=\s*\"\K[0-9A-F]{64}" install.ps1 | head -1 || true)
+  if [ -z "$pinned" ] || [ "$actual" != "$pinned" ]; then
+    if [ -n "$pinned" ]; then
+      sed -i -E "s/(\"$f\"[[:space:]]*=[[:space:]]*\")[0-9A-Fa-f]{64}/\1$actual/" install.ps1
+      echo "pre-commit: updated install.ps1 pin for $f"
+    else
+      echo "pre-commit: could not find pin for $f in install.ps1 - add it manually"
+      exit 1
+    fi
+    updated=1
+  fi
+done
+
+if [ "$updated" -eq 1 ]; then
+  git add install.ps1
+fi
+exit 0

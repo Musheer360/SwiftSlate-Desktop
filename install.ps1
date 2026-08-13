@@ -1,325 +1,294 @@
 # SwiftSlate Desktop
 # https://github.com/Musheer360/SwiftSlate-Desktop
-# irm https://raw.githubusercontent.com/Musheer360/SwiftSlate-Desktop/master/install.ps1 | iex
+# irm https://cdn.jsdelivr.net/gh/Musheer360/SwiftSlate-Desktop@master/install.ps1 | iex
 
+# --- Locations ---
 $installDir = Join-Path $env:USERPROFILE ".swiftslate"
 $runtimeDir = Join-Path $installDir "runtime"
 $startupDir = [Environment]::GetFolderPath("Startup")
 $shortcutPath = Join-Path $startupDir "SwiftSlate Desktop.lnk"
-$isInstalled = Test-Path (Join-Path $installDir "SwiftSlate.pyw")
-$repo = "https://raw.githubusercontent.com/Musheer360/SwiftSlate-Desktop/master"
-$repoFallback = "https://cdn.jsdelivr.net/gh/Musheer360/SwiftSlate-Desktop@master"
-$repoApi = "https://api.github.com/repos/Musheer360/SwiftSlate-Desktop/contents"
 
-# Expected SHA-256 of the files this installer version downloads. Any maintainer commit
-# that changes SwiftSlate.pyw or commands.json MUST update the matching hash below in the
-# SAME commit — otherwise this installer keeps accepting stale/mismatched content from
-# whichever of the three fetch channels answers, without ever detecting the drift.
-# Recompute with: certutil -hashfile <file> SHA256   (or `sha256sum <file>` on Linux/macOS)
-$expectedHashes = @{
-    "SwiftSlate.pyw" = "CA3481EAC54D3AE95A9E33B501EDF0F7525B16036FF51AEECCD2D5B649D43CC8"
+# --- Download sources ---
+$repoCdn = "https://cdn.jsdelivr.net/gh/Musheer360/SwiftSlate-Desktop@master"      # fast, may lag pushes ~12h
+$repoRaw = "https://raw.githubusercontent.com/Musheer360/SwiftSlate-Desktop/master" # always fresh
+$pythonVersion = "3.13.15"
+$pythonZipUrl = "https://www.python.org/ftp/python/$pythonVersion/python-$pythonVersion-embed-amd64.zip"
+# "3.13.15" -> "313" for python313.dll / python313.zip (major.minor only)
+$pyTag = (($pythonVersion -split '\.')[0] + ($pythonVersion -split '\.')[1])
+
+# Pinned SHA-256 hashes. Changing SwiftSlate.pyw or commands.json requires updating the
+# matching hash in the SAME commit; CI fails the build otherwise. The python.zip pin is
+# verified at install time and by CI (URL reachability); bump it whenever $pythonVersion
+# changes. Recompute with: sha256sum <file>  (or `Get-FileHash -Algorithm SHA256` on Windows)
+$hashes = @{
+    "SwiftSlate.pyw" = "DCE0BD60C2DE145368A5975D0D0C1F20CCDD792D68756117FA5831EF49A440DE"
     "commands.json"  = "CE38B3C4B48B56BA40B8BD23C58AE873C3B29D78BD8319FA96CEBB923A478E9A"
+    "python.zip"     = "D1F04D990AEE1253D8569E8E5104E30FA9F5FA830899F14843448872D936A2CF"
 }
 
-# Ensure TLS 1.2+ (older Windows/PowerShell may default to TLS 1.0 which many CDNs reject)
-# Tls13 is not defined on older .NET Framework builds - referencing it there throws,
-# which crashed the installer on exactly the systems this line was meant to help.
+# Fail loudly on errors instead of pretending; skip progress-bar overhead (slow on PS 5.1)
+$ErrorActionPreference = "Stop"
+$ProgressPreference = "SilentlyContinue"
+
+# TLS 1.2+ (older PowerShell defaults to TLS 1.0, which CDNs reject; Tls13 guard for old .NET)
 try {
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
 } catch {
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 }
 
+# --- Download a file (jsDelivr first, GitHub raw fallback), verifying its SHA-256 ---
+function Get-File {
+    param([string]$Name, [string]$OutFile)
+    $urls = @("$repoCdn/$Name", "$repoRaw/$Name")
+    foreach ($url in $urls) {
+        try {
+            Invoke-WebRequest -Uri $url -OutFile $OutFile -UseBasicParsing -TimeoutSec 30
+            $actual = (Get-FileHash -Path $OutFile -Algorithm SHA256).Hash
+            if ($actual -ieq $hashes[$Name]) { return }
+            Write-Host "  [BAD HASH] $url served unexpected content" -ForegroundColor DarkGray
+        } catch {
+            Write-Host "  [ERR] $url - $($_.Exception.Message)" -ForegroundColor DarkGray
+        }
+        Remove-Item $OutFile -Force -EA SilentlyContinue
+    }
+    throw "Could not download $Name from any source (network failure or failed integrity check). Check your internet connection, proxy/VPN, or antivirus, then run this command again."
+}
+
+# --- Stop running SwiftSlate instances and wait for them to exit ---
+function Stop-SwiftSlate {
+    $procIds = Get-CimInstance Win32_Process -EA SilentlyContinue |
+        Where-Object {
+            $_.CommandLine -like "*SwiftSlate.pyw*" -and (
+                # Our embedded runtime lives under the install dir; a system-Python
+                # launch is any python process whose command line references our
+                # script. This never matches an unrelated process (e.g. an editor
+                # that merely has the file open).
+                $_.ExecutablePath -like "$installDir*" -or $_.Name -like "python*"
+            )
+        } |
+        ForEach-Object { $_.ProcessId }
+    foreach ($procId in $procIds) {
+        Stop-Process -Id $procId -Force -EA SilentlyContinue
+    }
+    foreach ($procId in $procIds) {
+        Wait-Process -Id $procId -Timeout 10 -EA SilentlyContinue
+    }
+}
+
+# --- API key prompt that keeps the key out of the terminal history ---
 function Read-SecureKey {
     param([string]$Prompt)
     $sec = Read-Host $Prompt -AsSecureString
-    if (-not $sec) { return "" }
-    $bstr = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec)
-    try {
-        return [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr)
-    } finally {
-        [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
-    }
+    if ($null -eq $sec -or $sec.Length -eq 0) { return "" }
+    $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec)
+    try { return [Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr) }
+    finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
 }
 
-# --- Helper: verify a downloaded file's SHA-256 against the pinned expectation ---
-# Returns $true if the file has no pinned hash (nothing to check) or matches it.
-function Test-FileHash {
-    param([string]$File, [string]$OutFile)
-    $expected = $expectedHashes[$File]
-    if (-not $expected) { return $true }
-    $actual = (Get-FileHash -Path $OutFile -Algorithm SHA256).Hash
-    if ($actual -ieq $expected) { return $true }
-    Write-Host "  [HASH MISMATCH] $File expected $expected got $actual" -ForegroundColor DarkGray
-    Remove-Item $OutFile -Force -EA SilentlyContinue
-    return $false
-}
-
-# --- Helper: download with CDN fallback, verifying integrity against $expectedHashes ---
-function Get-File {
-    param([string]$File, [string]$OutFile)
-    $urls = @("$repo/$File", "$repoFallback/$File")
-    foreach ($url in $urls) {
-        try {
-            # Try Invoke-WebRequest first (standard approach)
-            Invoke-WebRequest -Uri $url -OutFile $OutFile -UseBasicParsing -TimeoutSec 30
-            if ((Test-Path $OutFile) -and (Get-Item $OutFile).Length -gt 0) {
-                if (Test-FileHash $File $OutFile) { return $true }
-                continue
-            }
-        } catch {
-            $err = $_.Exception.Message
-            if ($_.Exception.Response) {
-                $code = [int]$_.Exception.Response.StatusCode
-                Write-Host "  [$code] $url" -ForegroundColor DarkGray
-            } else {
-                Write-Host "  [ERR] $url" -ForegroundColor DarkGray
-                Write-Host "        $err" -ForegroundColor DarkGray
-            }
-        }
-    }
-    # Retry with .NET WebClient (bypasses PowerShell cmdlet issues)
-    foreach ($url in $urls) {
-        try {
-            (New-Object Net.WebClient).DownloadFile($url, $OutFile)
-            if ((Test-Path $OutFile) -and (Get-Item $OutFile).Length -gt 0) {
-                if (Test-FileHash $File $OutFile) { return $true }
-                continue
-            }
-        } catch {}
-    }
-    # Last resort: GitHub Contents API (different rate limit pool, returns base64)
+# --- Smoke test: does the runtime actually execute? ---
+function Test-Runtime {
+    param([string]$PythonExe)
     try {
-        $resp = Invoke-RestMethod -Uri "$repoApi/$File" -UseBasicParsing -TimeoutSec 30
-        if ($resp.content) {
-            $bytes = [Convert]::FromBase64String($resp.content)
-            [IO.File]::WriteAllBytes($OutFile, $bytes)
-            if ((Test-Path $OutFile) -and (Get-Item $OutFile).Length -gt 0) {
-                if (Test-FileHash $File $OutFile) { return $true }
-            }
-        }
+        & $PythonExe -c "import sys" 2>$null | Out-Null
+        return ($LASTEXITCODE -eq 0)
     } catch {
-        $err = $_.Exception.Message
-        Write-Host "  [API] $err" -ForegroundColor DarkGray
+        # A corrupt python.exe fails to start (terminating error under EAP=Stop) —
+        # treat that as a failed smoke test, never as an installer crash.
+        return $false
     }
-    return $false
-}
-$pythonVersion = "3.12.10"
-$pythonZipUrl = "https://www.python.org/ftp/python/$pythonVersion/python-$pythonVersion-embed-amd64.zip"
-# Published by python.org for this exact build. Recompute with `sha256sum` if $pythonVersion changes.
-$pythonZipHash = "4ACBED6DD1C744B0376E3B1CF57CE906F9DC9E95E68824584C8099A63025A3C3"
-
-# --- Helper: kill running SwiftSlate instances ---
-function Stop-SwiftSlate {
-    Get-Process pythonw, python -ErrorAction SilentlyContinue | ForEach-Object {
-        try { $cmd = (Get-CimInstance Win32_Process -Filter "ProcessId = $($_.Id)" -EA SilentlyContinue).CommandLine
-            if ($cmd -like "*SwiftSlate.pyw*") { Stop-Process -Id $_.Id -Force -EA SilentlyContinue }
-        } catch {}
-    }
-    Start-Sleep -Milliseconds 500
 }
 
+# --- Find or install a Python runtime; returns the path to pythonw.exe ---
+function Get-Pythonw {
+    $pywExe = Join-Path $runtimeDir "pythonw.exe"
+
+    # 1) Already-extracted embedded runtime (validated file set + smoke test).
+    # File names derive from $pythonVersion so a version bump never pins an old
+    # runtime forever or re-downloads on every run.
+    $required = @("pythonw.exe", "python.exe", "python$pyTag.dll", "python$pyTag.zip", "vcruntime140.dll")
+    $missing = $required | Where-Object { -not (Test-Path (Join-Path $runtimeDir $_)) }
+    if (-not $missing -and (Test-Runtime (Join-Path $runtimeDir "python.exe"))) {
+        return $pywExe
+    }
+
+    # 2) System Python 3.10+ with pythonw.exe
+    $sysPython = Get-Command python -EA SilentlyContinue
+    if ($sysPython) {
+        $ver = & python --version 2>&1
+        if ($ver -match "Python 3\.(\d+)" -and [int]$Matches[1] -ge 10) {
+            $pythonw = Join-Path (Split-Path $sysPython.Source) "pythonw.exe"
+            if (Test-Path $pythonw) { return $pythonw }
+        }
+    }
+
+    # 3) Download the portable runtime from python.org
+    Write-Host "  Downloading Python runtime..." -ForegroundColor DarkGray
+    $zipPath = Join-Path $env:TEMP "python-embed.zip"
+    try {
+        Invoke-WebRequest -Uri $pythonZipUrl -OutFile $zipPath -UseBasicParsing -TimeoutSec 300
+        $actual = (Get-FileHash -Path $zipPath -Algorithm SHA256).Hash
+        if ($actual -ine $hashes["python.zip"]) {
+            throw "integrity check failed (expected $($hashes['python.zip']), got $actual)"
+        }
+        # Extract to a fresh directory, verify, then swap — a mid-extract failure must
+        # never destroy a previously-working runtime.
+        $newDir = Join-Path $installDir "runtime.new"
+        Remove-Item $newDir -Recurse -Force -EA SilentlyContinue
+        Expand-Archive -Path $zipPath -DestinationPath $newDir
+        $missing = $required | Where-Object { -not (Test-Path (Join-Path $newDir $_)) }
+        if ($missing -or -not (Test-Runtime (Join-Path $newDir "python.exe"))) {
+            Remove-Item $newDir -Recurse -Force -EA SilentlyContinue
+            throw "Python runtime extraction was incomplete or corrupt."
+        }
+        Remove-Item $runtimeDir -Recurse -Force -EA SilentlyContinue
+        Move-Item $newDir $runtimeDir
+    } catch {
+        Remove-Item $zipPath -Force -EA SilentlyContinue
+        throw "Could not download the Python runtime from python.org ($($_.Exception.Message)). Check your internet connection or proxy and try again, or install Python 3.10+ from https://python.org/downloads - the installer will detect it."
+    }
+    Write-Host "  Python runtime ready." -ForegroundColor DarkGray
+    return $pywExe
+}
+
+# --- Main ---
 Write-Host ""
 Write-Host "  SwiftSlate Desktop" -ForegroundColor Cyan
 Write-Host ""
 
-# --- Already installed? ---
-if ($isInstalled) {
-    Write-Host "  Installed at $installDir" -ForegroundColor DarkGray
+if (-not [Environment]::Is64BitOperatingSystem) {
+    Write-Host "  SwiftSlate requires 64-bit Windows." -ForegroundColor Red
     Write-Host ""
-    Write-Host "  [1] Update" -ForegroundColor White
-    Write-Host "  [2] Uninstall" -ForegroundColor White
-    Write-Host "  [3] Cancel" -ForegroundColor White
-    Write-Host ""
-    $action = Read-Host "  Choice"
+    return
+}
 
-    if ($action -eq "2") {
-        $confirm = Read-Host "  Remove all data including config and commands? [y/N]"
-        if ($confirm -ne "y" -and $confirm -ne "Y") {
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if ($isAdmin) {
+    Write-Host "  Run this installer in a normal (non-admin) window so it installs for your own user account." -ForegroundColor Red
+    Write-Host ""
+    return
+}
+
+try {
+    $isInstalled = Test-Path (Join-Path $installDir "SwiftSlate.pyw")
+
+    # --- Already installed: update / uninstall / cancel ---
+    if ($isInstalled) {
+        Write-Host "  Installed at $installDir" -ForegroundColor DarkGray
+        Write-Host ""
+        Write-Host "  [1] Update" -ForegroundColor White
+        Write-Host "  [2] Uninstall" -ForegroundColor White
+        Write-Host "  [3] Cancel" -ForegroundColor White
+        Write-Host ""
+        $action = Read-Host "  Choice"
+
+        if ($action -eq "2") {
+            $confirm = Read-Host "  Remove all data including config and commands? [y/N]"
+            if ($confirm -notmatch "^[yY]$") {
+                Write-Host "  Cancelled." -ForegroundColor DarkGray
+                Write-Host ""
+                return
+            }
+            Stop-SwiftSlate
+            Remove-Item $shortcutPath -Force -EA SilentlyContinue
+            try {
+                Remove-Item $installDir -Recurse -Force
+            } catch {
+                Write-Host "  Could not remove $installDir (a file is still in use). Close SwiftSlate and delete it manually." -ForegroundColor Red
+                Write-Host ""
+                return
+            }
+            Write-Host ""
+            Write-Host "  Uninstalled." -ForegroundColor Green
+            Write-Host ""
+            return
+        } elseif ($action -ne "1") {
             Write-Host "  Cancelled." -ForegroundColor DarkGray
             Write-Host ""
             return
         }
         Stop-SwiftSlate
-        if (Test-Path $shortcutPath) { Remove-Item $shortcutPath -Force }
-        if (Test-Path $installDir) { Remove-Item $installDir -Recurse -Force }
         Write-Host ""
-        Write-Host "  Uninstalled." -ForegroundColor Green
-        Write-Host ""
-        return
-    } elseif ($action -ne "1") {
-        Write-Host "  Cancelled." -ForegroundColor DarkGray
-        Write-Host ""
-        return
     }
 
-    # Update: kill running instance before replacing files
-    Stop-SwiftSlate
-    Write-Host ""
-}
+    # --- Ensure install directory ---
+    if (-not (Test-Path $installDir)) { New-Item -ItemType Directory -Path $installDir -Force | Out-Null }
 
-# --- Install directory ---
-if (-not (Test-Path $installDir)) { New-Item -ItemType Directory -Path $installDir -Force | Out-Null }
+    # --- Python runtime ---
+    $pythonwExe = Get-Pythonw
 
-# --- Python ---
-$pythonwExe = $null
-$pythonExe = $null
-
-$sysPython = Get-Command python -EA SilentlyContinue
-if ($sysPython) {
-    $ver = & python --version 2>&1
-    if ($ver -match "Python 3\.(\d+)" -and [int]$Matches[1] -ge 10) {
-        $pythonExe = $sysPython.Source
-        $pythonwExe = Join-Path (Split-Path $pythonExe) "pythonw.exe"
-        if (-not (Test-Path $pythonwExe)) { $pythonwExe = $null }
-    }
-}
-
-# Check embedded runtime — validate it has essential files
-$embeddedPythonw = Join-Path $runtimeDir "pythonw.exe"
-$embeddedDll = Join-Path $runtimeDir "python312.dll"
-if ((Test-Path $embeddedPythonw) -and (Test-Path $embeddedDll)) {
-    $pythonwExe = $embeddedPythonw
-    $pythonExe = Join-Path $runtimeDir "python.exe"
-}
-
-if (-not $pythonwExe) {
-    Write-Host "  Downloading Python runtime..." -ForegroundColor DarkGray
-    $zipPath = Join-Path $env:TEMP "python-embed.zip"
-    try { Invoke-WebRequest -Uri $pythonZipUrl -OutFile $zipPath -UseBasicParsing } catch {
-        Write-Host "  Failed to download Python. Install Python 3.10+ manually: python.org/downloads" -ForegroundColor Red
-        return
-    }
-    $zipHash = (Get-FileHash -Path $zipPath -Algorithm SHA256).Hash
-    if ($zipHash -ine $pythonZipHash) {
-        Write-Host "  Python runtime failed integrity check (expected $pythonZipHash, got $zipHash)." -ForegroundColor Red
-        Write-Host "  Install Python 3.10+ manually: python.org/downloads" -ForegroundColor Red
-        Remove-Item $zipPath -Force -EA SilentlyContinue
-        return
-    }
-    if (-not (Test-Path $runtimeDir)) { New-Item -ItemType Directory -Path $runtimeDir -Force | Out-Null }
-    try { Expand-Archive -Path $zipPath -DestinationPath $runtimeDir -Force } catch {
-        Write-Host "  Failed to extract Python runtime." -ForegroundColor Red
-        return
-    }
-    Remove-Item $zipPath -Force -EA SilentlyContinue
-    $pythonwExe = Join-Path $runtimeDir "pythonw.exe"
-    $pythonExe = Join-Path $runtimeDir "python.exe"
-    if (-not (Test-Path $pythonwExe)) { Write-Host "  Python setup failed." -ForegroundColor Red; return }
-    Write-Host "  Python runtime ready." -ForegroundColor DarkGray
-}
-
-# --- Download (to temp first, then move — prevents partial overwrites) ---
-Write-Host "  Downloading..." -ForegroundColor DarkGray
-# Use .tmp extension (not .pyw.tmp) to avoid AV flagging Python file in temp
-$tempPyw = Join-Path $env:TEMP "swiftslate-download.tmp"
-if (-not (Get-File "SwiftSlate.pyw" $tempPyw)) {
-    # Fallback: try downloading directly to install dir
-    $directPath = Join-Path $installDir "SwiftSlate.pyw"
-    if (-not (Get-File "SwiftSlate.pyw" $directPath)) {
-        Write-Host ""
-        Write-Host "  Download failed. Try:" -ForegroundColor Red
-        Write-Host "  1. Check your internet connection" -ForegroundColor DarkGray
-        Write-Host "  2. Temporarily disable antivirus and retry" -ForegroundColor DarkGray
-        Write-Host "  3. Download manually from: https://github.com/Musheer360/SwiftSlate-Desktop" -ForegroundColor DarkGray
-        Write-Host ""
-        return
-    }
-} else {
+    # --- App files: download to temp, verify, then move into place ---
+    Write-Host "  Downloading..." -ForegroundColor DarkGray
+    $tempPyw = Join-Path $env:TEMP "swiftslate-download.tmp"
+    Get-File "SwiftSlate.pyw" $tempPyw
     Move-Item -Path $tempPyw -Destination (Join-Path $installDir "SwiftSlate.pyw") -Force
-}
 
-# Only download commands.json on fresh install (preserve user customizations on update)
-$commandsPath = Join-Path $installDir "commands.json"
-if (-not (Test-Path $commandsPath)) {
-    if (-not (Get-File "commands.json" $commandsPath)) {
-        Write-Host ""
-        Write-Host "  Download failed. Try:" -ForegroundColor Red
-        Write-Host "  1. Check your internet connection" -ForegroundColor DarkGray
-        Write-Host "  2. Download manually from: https://github.com/Musheer360/SwiftSlate-Desktop" -ForegroundColor DarkGray
-        Write-Host ""
-        return
-    }
-}
-
-# --- Config ---
-$configPath = Join-Path $installDir "config.json"
-if (-not (Test-Path $configPath)) {
-    Write-Host ""
-    Write-Host "  Provider:" -ForegroundColor DarkGray
-    Write-Host "  [1] Gemini  (free tier, recommended)" -ForegroundColor White
-    Write-Host "  [2] Groq    (free tier)" -ForegroundColor White
-    Write-Host "  [3] Custom  (OpenAI-compatible)" -ForegroundColor White
-    Write-Host ""
-    $prov = Read-Host "  Choice [default: 1]"
-
-    $provider = "gemini"; $endpoint = ""; $model = ""; $apiKey = ""
-
-    switch ($prov) {
-        "2" {
-            $provider = "groq"
-            Write-Host ""; Write-Host "  Key: https://console.groq.com/keys" -ForegroundColor Yellow
-            Write-Host ""
-            $apiKey = Read-SecureKey "  API Key"
-            Write-Host ""
-            Write-Host "  [1] openai/gpt-oss-120b (default)" -ForegroundColor White
-            Write-Host "  [2] qwen/qwen3.6-27b (faster)" -ForegroundColor White
-            Write-Host ""
-            $m = Read-Host "  Model [default: 1]"
-            $model = switch ($m) { "2" { "qwen/qwen3.6-27b" } default { "openai/gpt-oss-120b" } }
-        }
-        "3" {
-            $provider = "custom"
-            Write-Host ""
-            $endpoint = Read-Host "  Endpoint (e.g. http://localhost:11434/v1)"
-            Write-Host ""
-            $apiKey = Read-SecureKey "  API Key (Enter to skip)"
-            if ([string]::IsNullOrWhiteSpace($apiKey)) { $apiKey = "none" }
-            Write-Host ""
-            $model = Read-Host "  Model name"
-            if ([string]::IsNullOrWhiteSpace($model)) { $model = "default" }
-        }
-        default {
-            $provider = "gemini"
-            Write-Host ""; Write-Host "  Key: https://aistudio.google.com/api-keys" -ForegroundColor Yellow
-            Write-Host ""
-            $apiKey = Read-SecureKey "  API Key"
-            Write-Host ""
-            Write-Host "  [1] gemini-3.5-flash-lite (default)" -ForegroundColor White
-            Write-Host "  [2] gemini-3.6-flash" -ForegroundColor White
-            Write-Host ""
-            $m = Read-Host "  Model [default: 1]"
-            $model = switch ($m) { "2" { "gemini-3.6-flash" } default { "gemini-3.5-flash-lite" } }
+    # commands.json: only on fresh install, to preserve user customizations; non-fatal
+    $commandsPath = Join-Path $installDir "commands.json"
+    if (-not (Test-Path $commandsPath)) {
+        try {
+            Get-File "commands.json" $commandsPath
+        } catch {
+            Write-Host "  Could not download commands.json - continuing with built-in commands." -ForegroundColor DarkGray
         }
     }
 
-    if ([string]::IsNullOrWhiteSpace($apiKey)) { Write-Host "  No API key." -ForegroundColor Red; return }
+    # --- Config (only on fresh install) ---
+    $configPath = Join-Path $installDir "config.json"
+    if (-not (Test-Path $configPath)) {
+        Write-Host ""
+        Write-Host "  Provider:" -ForegroundColor DarkGray
+        Write-Host "  [1] Gemini  (free tier, recommended)" -ForegroundColor White
+        Write-Host "  [2] Groq    (free tier)" -ForegroundColor White
+        Write-Host "  [3] Custom  (OpenAI-compatible)" -ForegroundColor White
+        Write-Host ""
+        $prov = Read-Host "  Choice [default: 1]"
 
-    # --- Spinner & timing ---
-    Write-Host ""
-    Write-Host "  Spinner speed (how fast text animates while processing):" -ForegroundColor DarkGray
-    Write-Host "  [1] Fast (100ms, high-end PC)" -ForegroundColor White
-    Write-Host "  [2] Normal (200ms, recommended)" -ForegroundColor White
-    Write-Host "  [3] Slow (300ms, older machines)" -ForegroundColor White
-    Write-Host "  [4] Static [Processing...] (safest, no animation)" -ForegroundColor White
-    Write-Host ""
-    $sp = Read-Host "  Choice [default: 2]"
-    $keyDelay = 200
-    $spinner = "animated"
-    if ($sp -eq "1") { $keyDelay = 100 }
-    elseif ($sp -eq "3") { $keyDelay = 300 }
-    elseif ($sp -eq "4") { $keyDelay = 200; $spinner = "static" }
+        $cfg = @{ provider = "gemini" }
+        if ($prov -eq "2") {
+            $cfg.provider = "groq"
+            Write-Host ""
+            Write-Host "  Key: https://console.groq.com/keys" -ForegroundColor Yellow
+            Write-Host ""
+            $cfg.api_keys = @(Read-SecureKey "  API Key")
+        } elseif ($prov -eq "3") {
+            $cfg.provider = "custom"
+            Write-Host ""
+            $cfg.endpoint = Read-Host "  Endpoint (e.g. http://localhost:11434/v1)"
+            Write-Host ""
+            $key = Read-SecureKey "  API Key (Enter to skip)"
+            if ([string]::IsNullOrWhiteSpace($key)) { $key = "none" }
+            $cfg.api_keys = @($key)
+        } else {
+            Write-Host ""
+            Write-Host "  Key: https://aistudio.google.com/api-keys" -ForegroundColor Yellow
+            Write-Host ""
+            $cfg.api_keys = @(Read-SecureKey "  API Key")
+        }
 
-    $cfg = @{ api_keys = @($apiKey); model = $model; provider = $provider; temperature = 0.5; prefix = "?"; key_delay = $keyDelay; spinner = $spinner }
-    if ($endpoint) { $cfg.endpoint = $endpoint }
-    [System.IO.File]::WriteAllText($configPath, ($cfg | ConvertTo-Json -Depth 3), (New-Object System.Text.UTF8Encoding $false))
-}
+        if ([string]::IsNullOrWhiteSpace([string]$cfg.api_keys[0]) -and $cfg.provider -ne "custom") {
+            Write-Host "  No API key." -ForegroundColor Red
+            Write-Host ""
+            return
+        }
+        [IO.File]::WriteAllText($configPath, ($cfg | ConvertTo-Json), (New-Object Text.UTF8Encoding $false))
+    }
 
-# --- Startup shortcut (create or update) ---
-if (-not $isInstalled) {
-    Write-Host ""
-    $su = Read-Host "  Start on login? [Y/n]"
-    if ($su -ne "n" -and $su -ne "N") {
+    # --- Startup shortcut ---
+    if (-not $isInstalled) {
+        Write-Host ""
+        $su = Read-Host "  Start on login? [Y/n]"
+        if ($su -notmatch "^[nN]$") {
+            $sh = New-Object -ComObject WScript.Shell
+            $sc = $sh.CreateShortcut($shortcutPath)
+            $sc.TargetPath = $pythonwExe
+            $sc.Arguments = "`"$(Join-Path $installDir 'SwiftSlate.pyw')`""
+            $sc.WorkingDirectory = $installDir
+            $sc.Description = "SwiftSlate Desktop"
+            $sc.Save()
+        }
+    } elseif (Test-Path $shortcutPath) {
+        # Update: keep the shortcut pointing at the current runtime
         $sh = New-Object -ComObject WScript.Shell
         $sc = $sh.CreateShortcut($shortcutPath)
         $sc.TargetPath = $pythonwExe
@@ -328,34 +297,27 @@ if (-not $isInstalled) {
         $sc.Description = "SwiftSlate Desktop"
         $sc.Save()
     }
-} elseif (Test-Path $shortcutPath) {
-    # Update: ensure shortcut points to current pythonwExe
-    $sh = New-Object -ComObject WScript.Shell
-    $sc = $sh.CreateShortcut($shortcutPath)
-    if ($sc.TargetPath -ne $pythonwExe) {
-        $sc.TargetPath = $pythonwExe
-        $sc.Arguments = "`"$(Join-Path $installDir 'SwiftSlate.pyw')`""
-        $sc.WorkingDirectory = $installDir
-        $sc.Save()
+
+    # --- Done ---
+    Write-Host ""
+    if ($isInstalled) { Write-Host "  Updated." -ForegroundColor Green }
+    else { Write-Host "  Installed." -ForegroundColor Green }
+    Write-Host ""
+    Write-Host "  Config:   $configPath" -ForegroundColor DarkGray
+    Write-Host "  Commands: $commandsPath" -ForegroundColor DarkGray
+    Write-Host ""
+
+    $start = Read-Host "  Start now? [Y/n]"
+    if ($start -notmatch "^[nN]$") {
+        Stop-SwiftSlate
+        Start-Process $pythonwExe -ArgumentList "`"$(Join-Path $installDir 'SwiftSlate.pyw')`"" -WorkingDirectory $installDir
+        Write-Host "  Started." -ForegroundColor Green
     }
+} catch {
+    Write-Host ""
+    Write-Host "  Installer failed: $($_.Exception.Message)" -ForegroundColor Red
+    if ($_ -is [System.IO.IOException]) {
+        Write-Host "  If a file is in use, close SwiftSlate from the tray icon and run the installer again." -ForegroundColor DarkGray
+    }
+    Write-Host ""
 }
-
-# --- Done ---
-Write-Host ""
-if ($isInstalled) {
-    Write-Host "  Updated." -ForegroundColor Green
-} else {
-    Write-Host "  Installed." -ForegroundColor Green
-}
-Write-Host ""
-Write-Host "  Config:   $installDir\config.json" -ForegroundColor DarkGray
-Write-Host "  Commands: $installDir\commands.json" -ForegroundColor DarkGray
-Write-Host ""
-
-$start = Read-Host "  Start now? [Y/n]"
-if ($start -ne "n" -and $start -ne "N") {
-    Stop-SwiftSlate
-    Start-Process $pythonwExe -ArgumentList "`"$(Join-Path $installDir 'SwiftSlate.pyw')`"" -WorkingDirectory $installDir
-    Write-Host "  Started." -ForegroundColor Green
-}
-Write-Host ""

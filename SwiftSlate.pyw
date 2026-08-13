@@ -50,6 +50,12 @@ NIIF_ERROR = 0x00000003
 NIIF_NOSOUND = 0x00000010
 NOTIFYICON_VERSION_4 = 4
 WM_TRAYICON = 0x8001
+WM_LBUTTONDBLCLK = 0x0203
+WM_RBUTTONUP = 0x0205
+TPM_RETURNCMD = 0x0100
+TPM_RIGHTBUTTON = 0x0002
+MF_STRING = 0x0000
+MENU_ID_EXIT = 1002
 
 # --- Win32 API ---
 user32 = ctypes.windll.user32
@@ -87,6 +93,24 @@ kernel32.GlobalUnlock.argtypes = [wt.HANDLE]
 kernel32.GlobalUnlock.restype = wt.BOOL
 kernel32.GlobalFree.argtypes = [wt.HANDLE]
 kernel32.GlobalFree.restype = wt.HANDLE
+kernel32.GlobalSize.argtypes = [wt.HANDLE]
+kernel32.GlobalSize.restype = ctypes.c_size_t
+user32.EnumClipboardFormats.argtypes = [wt.UINT]
+user32.EnumClipboardFormats.restype = wt.UINT
+user32.SetForegroundWindow.argtypes = [wt.HWND]
+user32.SetForegroundWindow.restype = wt.BOOL
+user32.GetCursorPos.argtypes = [ctypes.POINTER(wt.POINT)]
+user32.GetCursorPos.restype = wt.BOOL
+user32.CreatePopupMenu.restype = wt.HANDLE
+user32.AppendMenuW.argtypes = [wt.HANDLE, wt.UINT, ULONG_PTR, wt.LPCWSTR]
+user32.AppendMenuW.restype = wt.BOOL
+user32.TrackPopupMenu.argtypes = [wt.HANDLE, wt.UINT, ctypes.c_int, ctypes.c_int,
+                                  ctypes.c_int, wt.HWND, wt.LPVOID]
+user32.TrackPopupMenu.restype = wt.UINT
+user32.DestroyMenu.argtypes = [wt.HANDLE]
+user32.DestroyMenu.restype = wt.BOOL
+user32.DestroyWindow.argtypes = [wt.HWND]
+user32.DestroyWindow.restype = wt.BOOL
 # -- Window --
 user32.CreateWindowExW.argtypes = [wt.DWORD, wt.LPCWSTR, wt.LPCWSTR, wt.DWORD,
                                    ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
@@ -289,6 +313,8 @@ MAX_REPLACER_OUTPUT_BYTES = 65_536
 last_fg_hwnd = 0  # Track foreground window for buffer clearing
 last_keystroke_time = 0.0  # Timestamp of last keystroke for idle gap detection
 BUFFER_IDLE_TIMEOUT = 2.5  # Seconds of silence before clearing buffer (catches mouse-click field switches)
+last_typed_vkey = 0  # VKey of the keystroke that fired the last trigger
+last_typed_vkey_time = 0.0  # When it arrived (auto-repeat detection while processing)
 
 # Pre-computed trigger data
 trigger_strings = {}  # trigger_name -> prefix+trigger_name
@@ -616,6 +642,22 @@ def load_config():
     commands = new_commands
     trigger_strings = new_trigger_strings
     trigger_last_chars = new_trigger_last_chars
+
+    # Warn about shadowed triggers: trigger detection fires on the first match, so if one
+    # trigger is a prefix of another (e.g. "fix" and "fixit"), the shorter one always wins
+    # and the longer can never fire by typing. Silent shadowing made commands look broken.
+    shadowed = []
+    names = sorted(new_commands, key=len)
+    for i, a in enumerate(names):
+        for b in names[i+1:]:
+            if b.startswith(a):
+                shadowed.append((a, b))
+    if shadowed:
+        a, b = shadowed[0]
+        extra = f" (+{len(shadowed)-1} more)" if len(shadowed) > 1 else ""
+        for a2, b2 in shadowed:
+            log(f"WARNING: trigger '{a2}' is a prefix of '{b2}' — '{b2}' will never fire")
+        notify("SwiftSlate", f"Trigger '{a}' shadows '{b}' — the shorter one always fires first.{extra}", NIIF_WARNING)
     # Buffer only needs to hold the longest trigger (+ margin for translate:XXXXX).
     # Smaller buffer = less sensitive typed data held in memory at any time.
     longest_trigger = max((len(f) for f in new_trigger_strings.values()), default=20)
@@ -1005,6 +1047,10 @@ def call_api(text, prompt):
                     break
                 # Network is fine — problem is provider-side, try next key
                 log("Network OK — retrying with next key")
+                # README-documented behavior: wait 1s before retrying — transient blips
+                # (DNS hiccups, Wi-Fi roam) usually clear within a second, and the pause
+                # avoids hammering the provider with an immediate re-request.
+                time.sleep(1)
                 failure_reason = f"Provider unreachable ({type(e).__name__})."
                 continue
             else:
@@ -1026,6 +1072,21 @@ def call_api(text, prompt):
 
     log(f"API call failed: {failure_reason}")
     return None, failure_reason
+
+class _SecureRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse redirects that would send the API key over plaintext HTTP or to a
+    different host. Providers don't redirect API POSTs, so this is a hard safety
+    net: a compromised/redirecting endpoint can't leak the key in cleartext."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        old = urllib.parse.urlparse(req.full_url)
+        new = urllib.parse.urlparse(newurl)
+        if new.scheme != "https" or new.netloc != old.netloc:
+            return None
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_secure_opener = urllib.request.build_opener(_SecureRedirectHandler())
 
 def _call_gemini(text, system_content, key):
     """Call Google Gemini API (generateContent endpoint). Raises on HTTP errors.
@@ -1064,7 +1125,7 @@ def _call_gemini(text, system_content, key):
     }, method="POST")
 
     # Let exceptions propagate to call_api retry loop
-    with urllib.request.urlopen(req, timeout=45) as resp:
+    with _secure_opener.open(req, timeout=45) as resp:
         try:
             data = json.loads(_read_response_bounded(resp).decode("utf-8"))
         except (ValueError, UnicodeDecodeError) as parse_err:
@@ -1136,7 +1197,7 @@ def _call_openai_compatible(text, system_content, key, endpoint):
     }, method="POST")
 
     # Let exceptions propagate to call_api retry loop
-    with urllib.request.urlopen(req, timeout=45) as resp:
+    with _secure_opener.open(req, timeout=45) as resp:
         try:
             data = json.loads(_read_response_bounded(resp).decode("utf-8"))
         except (ValueError, UnicodeDecodeError) as parse_err:
@@ -1165,8 +1226,48 @@ def _call_openai_compatible(text, system_content, key, endpoint):
             raise ApiResponseError("Provider returned an unreadable response. Try again.") from parse_err
 
 # --- Clipboard (silent, no history pollution) ---
-def set_clipboard_silent(text):
-    """Set clipboard text, excluding from history. Returns True on success."""
+# Formats that can be copied as raw bytes and re-set later. Text formats are skipped
+# (restored via CF_UNICODETEXT), GDI-handle formats (CF_BITMAP, metafiles) and
+# CF_OWNERDISPLAY cannot survive an EmptyClipboard by copying bytes.
+def _snapshot_nontext_clipboard():
+    """Byte-copy every non-text clipboard format into memory so the user's image or
+    file selection survives the grab's EmptyClipboard. Returns a list of (fmt, bytes)."""
+    saved = []
+    if not user32.OpenClipboard(None):
+        return saved
+    try:
+        fmt = 0
+        while True:
+            fmt = user32.EnumClipboardFormats(fmt)
+            if fmt == 0:
+                break
+            if fmt in (1, 2, 3, 7, 13, 14, 0x80):  # TEXT/OEMTEXT/UNICODETEXT, BITMAP, metafiles, owner-display
+                continue
+            if fmt in (cf_exclude, cf_no_history, cf_no_cloud):
+                continue
+            h = user32.GetClipboardData(fmt)
+            if not h:
+                continue
+            size = kernel32.GlobalSize(h)
+            if not size or size > 16 * 1024 * 1024:
+                continue  # refuse to buffer huge blobs
+            ptr = kernel32.GlobalLock(h)
+            if not ptr:
+                continue
+            try:
+                saved.append((fmt, ctypes.string_at(ptr, size)))
+            finally:
+                kernel32.GlobalUnlock(h)
+    except (OSError, ValueError, ctypes.ArgumentError):
+        pass
+    finally:
+        user32.CloseClipboard()
+    return saved
+
+def set_clipboard_silent(text, extra_formats=None):
+    """Set clipboard text, excluding from history. Returns True on success.
+    extra_formats: (fmt, bytes) pairs from _snapshot_nontext_clipboard() to restore
+    alongside the text (e.g. the user's image that the grab had to clear)."""
     # Use hwnd_main as clipboard owner so EmptyClipboard + SetClipboardData works correctly.
     # Per MS docs, OpenClipboard(NULL) + EmptyClipboard sets owner to NULL, which can
     # cause SetClipboardData to fail.
@@ -1204,6 +1305,18 @@ def set_clipboard_silent(text):
                             kernel32.GlobalFree(h)
                     else:
                         kernel32.GlobalFree(h)
+
+        # Restore snapshotted non-text formats (image, file drop, HTML, ...)
+        for fmt, blob in (extra_formats or []):
+            hmem = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(blob))
+            if not hmem:
+                continue
+            ptr = kernel32.GlobalLock(hmem)
+            if ptr:
+                ctypes.memmove(ptr, blob, len(blob))
+                kernel32.GlobalUnlock(hmem)
+            if not user32.SetClipboardData(fmt, hmem):
+                kernel32.GlobalFree(hmem)
         return True
     finally:
         user32.CloseClipboard()
@@ -1220,8 +1333,14 @@ def get_clipboard_text():
             ptr = kernel32.GlobalLock(h)
             if ptr:
                 try:
-                    text = ctypes.wstring_at(ptr)
-                    return text
+                    # Bound the read by the allocation size: CF_UNICODETEXT is not
+                    # guaranteed NUL-terminated, and wstring_at on an unterminated
+                    # string from a local process would walk past the buffer (crash).
+                    size = kernel32.GlobalSize(h)
+                    if not size:
+                        return None
+                    text = ctypes.wstring_at(ptr, min(size // 2, 8 * 1024 * 1024))
+                    return text.rstrip("\0")
                 finally:
                     kernel32.GlobalUnlock(h)
     except (OSError, ValueError, ctypes.ArgumentError):
@@ -1347,13 +1466,17 @@ def _replace_last_char(ch, expected_hwnd):
 
 # --- Grab text from active field ---
 def grab_field_text():
-    """Ctrl+A, Ctrl+C, wait for clipboard change via sequence number."""
+    """Ctrl+A, Ctrl+C, wait for clipboard change via sequence number.
+    Returns (text, prev_text, prev_extra): the field text, the clipboard text that
+    was present before (None if none), and any non-text clipboard formats (image,
+    file drop, ...) snapshotted so callers can restore them later."""
     prev = get_clipboard_text()
+    prev_extra = _snapshot_nontext_clipboard()
 
     # Attach our thread to the foreground window's input queue
     fg = user32.GetForegroundWindow()
     if not fg:
-        return None, prev
+        return None, prev, prev_extra
     fg_tid = user32.GetWindowThreadProcessId(fg, None)
     our_tid = kernel32.GetCurrentThreadId()
     attached = False
@@ -1371,11 +1494,11 @@ def grab_field_text():
 
         # Never inject Ctrl+A/Ctrl+C while the user still holds a modifier key
         if not _wait_modifiers_released(1.0) or user32.GetForegroundWindow() != fg:
-            return None, prev
+            return None, prev, prev_extra
         send_keys("^a")
         time.sleep(key_delay)  # Ctrl+A needs time before Ctrl+C
         if user32.GetForegroundWindow() != fg:
-            return None, prev
+            return None, prev, prev_extra
         send_keys("^c")
 
         # Wait for clipboard sequence number to change from post-clear value
@@ -1384,9 +1507,9 @@ def grab_field_text():
             if user32.GetClipboardSequenceNumber() != seq_after_clear:
                 text = get_clipboard_text()
                 if text:
-                    return text, prev
+                    return text, prev, prev_extra
                 # Clipboard changed but no text (image/file) — done
-                return None, prev
+                return None, prev, prev_extra
     finally:
         if attached:
             user32.AttachThreadInput(our_tid, fg_tid, False)
@@ -1398,7 +1521,7 @@ def grab_field_text():
             _make_key(VK_RIGHT, KEYEVENTF_KEYUP),
         )
         user32.SendInput(2, ctypes.byref(inputs_deselect), ctypes.sizeof(INPUT))
-    return None, prev
+    return None, prev, prev_extra
 
 # --- Paste text into active field ---
 def paste_text(text):
@@ -1454,21 +1577,20 @@ def do_transform(trigger_name, prompt):
     hwnd = user32.GetForegroundWindow()
     trigger_full = prefix + trigger_name
     prev_clip = None
-    clip_seq_at_grab = user32.GetClipboardSequenceNumber()
 
     try:
-        full_text, prev_clip = grab_field_text()
+        full_text, prev_clip, prev_extra = grab_field_text()
         if not full_text or not full_text.strip():
             log("No text captured")
             # Reading the field is the app's most failure-prone step (Chromium fields, a
             # contested clipboard, the 1s timeout). Staying silent here made the app look
             # simply broken; the sibling workers already notify for the same condition.
+            # The grab emptied the clipboard for its sequence baseline, so restore both
+            # the user's text and any non-text content (image, file drop) before bailing.
+            if prev_clip is not None or prev_extra:
+                set_clipboard_silent(prev_clip or "", prev_extra)
             _notify_debounced("Could not read the text in this field.", NIIF_WARNING)
             return
-
-        # Record clipboard sequence at grab time — only restore prev_clip if
-        # nobody else has written to the clipboard since then.
-        clip_seq_at_grab = user32.GetClipboardSequenceNumber()
 
         # Strip trigger (case-insensitive for translate:XX)
         input_text = full_text
@@ -1494,6 +1616,11 @@ def do_transform(trigger_name, prompt):
         def api_thread():
             try:
                 result_holder[0], error_holder[0] = call_api(input_text, prompt)
+            except Exception as e:
+                # call_api is exception-total today; this guard keeps the daemon thread
+                # from dying silently under pythonw if that ever changes.
+                log(f"API thread crashed: {e}")
+                error_holder[0] = f"Transform failed: {type(e).__name__}."
             finally:
                 done_event.set()
 
@@ -1611,7 +1738,43 @@ def do_transform(trigger_name, prompt):
             log("Spinner timed out — waiting for in-flight API worker without further injection")
             _notify_debounced("Transform is still finishing; new transforms are paused.", NIIF_WARNING)
             done_event.wait()
-            prev_clip = None
+            # The worker is done now — read the result and finish the job. The spinner
+            # glyph may still sit in the field; replacing it is safe only if the user
+            # hasn't resumed typing while we waited.
+            result = result_holder[0]
+            error_reason = error_holder[0]
+            if abort_event.is_set():
+                # User resumed typing during the wait — never overwrite their input.
+                log("Timed-out transform: user resumed typing, result to clipboard")
+                if result:
+                    if set_clipboard_silent(result):
+                        _notify_debounced("You kept typing - result copied to clipboard instead.", NIIF_INFO)
+                    else:
+                        _notify_debounced("You kept typing, and the result could not be saved to the clipboard.", NIIF_ERROR)
+                else:
+                    _notify_debounced(error_reason or "Transform failed.", NIIF_ERROR)
+                prev_clip = None
+            elif result:
+                if user32.GetForegroundWindow() == hwnd:
+                    time.sleep(0.05)
+                    if not _retry_paste(result):
+                        if set_clipboard_silent(result):
+                            log("Timed-out paste failed — result placed on clipboard")
+                            _notify_debounced("Paste failed. Result copied to clipboard.", NIIF_WARNING)
+                        else:
+                            _notify_debounced("Could not insert the result. Try again.", NIIF_ERROR)
+                        prev_clip = None
+                else:
+                    if set_clipboard_silent(result):
+                        _notify_debounced("Window lost focus - result copied to clipboard.", NIIF_INFO)
+                    else:
+                        _notify_debounced("Window lost focus and the result could not be saved to the clipboard.", NIIF_ERROR)
+                    prev_clip = None
+            else:
+                # API failed — restore original text (remove spinner glyph)
+                log("Timed-out transform: API returned nothing — restoring original text")
+                _retry_paste(input_text)
+                _notify_debounced(error_reason or "Transform failed.", NIIF_ERROR)
         elif aborted:
             # Never overwrite a field after the user has resumed typing. A spinner glyph may
             # remain, but preserving the user's actual keystrokes is more important.
@@ -1664,17 +1827,14 @@ def do_transform(trigger_name, prompt):
             # Don't restore prev_clip — leave result available
             prev_clip = None
     finally:
-        # Only restore prev_clip if clipboard hasn't been modified by an external
-        # app since we grabbed it. Our own operations (spinner paste, result paste)
-        # bump the sequence — but those paths already set prev_clip = None.
-        # This guard catches the case where prev_clip is still set (e.g., API failed
-        # and we restored original) but the user manually copied something during the wait.
+        # Only restore prev_clip if the clipboard still belongs to us. An external
+        # copy changes the owner, and that fresh content must never be clobbered.
+        # Sequence counting is unreliable once non-text formats are restored too,
+        # so ownership is the signal.
         time.sleep(0.2)
-        if prev_clip is not None:
-            current_seq = user32.GetClipboardSequenceNumber()
-            # Allow up to 4 sequence bumps from our own operations (clear + spinner + result + restore)
-            if user32.GetClipboardOwner() == hwnd_main and (current_seq - clip_seq_at_grab) <= 4:
-                set_clipboard_silent(prev_clip)
+        if prev_clip is not None or prev_extra:
+            if user32.GetClipboardOwner() == hwnd_main:
+                set_clipboard_silent(prev_clip or "", prev_extra)
             else:
                 log("Clipboard changed externally — skipping restoration")
         processing = False
@@ -1691,7 +1851,13 @@ def do_undo():
             _notify_debounced("Nothing to undo.", NIIF_INFO)
             return
 
-        _, prev_clip = grab_field_text()
+        _, prev_clip, prev_extra = grab_field_text()
+        if abort_event.is_set():
+            log("Undo aborted — user is typing")
+            _notify_debounced("Cancelled - you were typing.", NIIF_INFO)
+            if prev_clip is not None or prev_extra:
+                set_clipboard_silent(prev_clip or "", prev_extra)
+            return
         if paste_text(last_original_text):
             # Only discard the undo point once the text is actually back. Clearing it
             # unconditionally destroyed the original on a failed paste, and the next ?undo
@@ -1703,8 +1869,13 @@ def do_undo():
             _notify_debounced("Could not undo.", NIIF_ERROR)
 
         time.sleep(0.2)
-        if prev_clip:
-            set_clipboard_silent(prev_clip)
+        if prev_clip is not None or prev_extra:
+            # Same owner guard as do_transform: if the user copied something else
+            # during the undo, don't clobber their fresh clipboard content.
+            if user32.GetClipboardOwner() == hwnd_main:
+                set_clipboard_silent(prev_clip or "", prev_extra)
+            else:
+                log("Clipboard changed externally — skipping restoration")
     except Exception as e:
         # Without this the daemon thread dies silently under pythonw (no console, and no
         # log file unless --debug), so the trigger appeared to do nothing at all.
@@ -1715,20 +1886,20 @@ def do_undo():
 
 # --- Clipboard commands ---
 def do_clipboard_command(command):
-    global processing, internal_clipboard
+    global processing, internal_clipboard, last_original_text
     log(f"--- Clipboard: ?{command} ---")
 
     try:
         trigger_full = prefix + command
-        full_text, prev_clip = grab_field_text()
+        full_text, prev_clip, prev_extra = grab_field_text()
 
         if not full_text:
             log("No text captured")
             _notify_debounced("Could not read the text in this field.", NIIF_WARNING)
             # grab_field_text() empties the clipboard to get a sequence-number baseline, so
             # returning without restoring left the user holding an empty clipboard.
-            if prev_clip:
-                set_clipboard_silent(prev_clip)
+            if prev_clip is not None or prev_extra:
+                set_clipboard_silent(prev_clip or "", prev_extra)
             return
 
         # The trigger must be the last thing in the field. grab_field_text() selects all, so
@@ -1737,10 +1908,22 @@ def do_clipboard_command(command):
         if not full_text.endswith(trigger_full):
             log("Clipboard command: trigger not at end of field, leaving text unchanged")
             _notify_debounced(f"{prefix}{command} only works at the end of the text.", NIIF_WARNING)
-            if prev_clip:
-                set_clipboard_silent(prev_clip)
+            if prev_clip is not None or prev_extra:
+                set_clipboard_silent(prev_clip or "", prev_extra)
             return
         text_before = full_text[:-len(trigger_full)].rstrip()
+
+        # The paste below replaces the field. If the user started typing after the grab,
+        # pasting would destroy their keystrokes — abort like do_transform does.
+        if abort_event.is_set():
+            log("Clipboard command aborted — user is typing")
+            _notify_debounced("Cancelled - you were typing.", NIIF_INFO)
+            if prev_clip is not None or prev_extra:
+                set_clipboard_silent(prev_clip or "", prev_extra)
+            return
+
+        # Record the undo point so ?undo restores the text this command replaces.
+        last_original_text = text_before
 
         if command == "copy":
             if not text_before.strip():
@@ -1793,8 +1976,8 @@ def do_clipboard_command(command):
                 _notify_debounced("Clipboard is empty.", NIIF_INFO)
 
         time.sleep(0.2)
-        if prev_clip:
-            set_clipboard_silent(prev_clip)
+        if prev_clip is not None or prev_extra:
+            set_clipboard_silent(prev_clip or "", prev_extra)
     except Exception as e:
         log(f"Clipboard command failed: {e}")
         _notify_debounced("Clipboard operation failed.", NIIF_ERROR)
@@ -1803,37 +1986,46 @@ def do_clipboard_command(command):
 
 # --- Replacer commands ---
 def do_replacer(trigger_name, cmd_type, value):
-    global processing
+    global processing, last_original_text
     log(f"--- Replacer ({cmd_type}): ?{trigger_name} ---")
 
     try:
         trigger_full = prefix + trigger_name
-        full_text, prev_clip = grab_field_text()
+        full_text, prev_clip, prev_extra = grab_field_text()
 
         if not full_text:
             log("No text captured")
             _notify_debounced("Could not read the text in this field.", NIIF_WARNING)
             # grab_field_text() empties the clipboard for its sequence baseline, so returning
             # without restoring left the user holding an empty clipboard.
-            if prev_clip:
-                set_clipboard_silent(prev_clip)
+            if prev_clip is not None or prev_extra:
+                set_clipboard_silent(prev_clip or "", prev_extra)
             return
 
         # The trigger must be at the end of the captured text. grab_field_text() does a
         # select-all, so full_text is the WHOLE field — without this guard a trigger that
         # isn't the last thing in a multi-line field left `before` empty and the paste
-        # below replaced the entire field with just the replacement (unrecoverable:
-        # do_replacer never records undo state).
+        # below replaced the entire field with just the replacement.
         # grab_field_text() leaves the field itself untouched, so the safe action is to
         # do nothing but put the user's clipboard back.
         if not full_text.endswith(trigger_full):
             log("Replacer: trigger not at end of field, leaving text unchanged")
             _notify_debounced(f"{prefix}{trigger_name} only works at the end of the text.", NIIF_WARNING)
-            if prev_clip:
-                set_clipboard_silent(prev_clip)
+            if prev_clip is not None or prev_extra:
+                set_clipboard_silent(prev_clip or "", prev_extra)
             return
 
         before = full_text[:-len(trigger_full)]
+
+        # Record the undo point so ?undo restores this exact text after the replacement.
+        last_original_text = before.rstrip()
+
+        if abort_event.is_set():
+            log("Replacer aborted — user is typing")
+            _notify_debounced("Cancelled - you were typing.", NIIF_INFO)
+            if prev_clip is not None or prev_extra:
+                set_clipboard_silent(prev_clip or "", prev_extra)
+            return
 
         replacement = ""
         shell_error = None
@@ -1851,7 +2043,15 @@ def do_replacer(trigger_name, cmd_type, value):
                     try:
                         proc.wait(timeout=3)
                     except subprocess.TimeoutExpired:
-                        proc.kill()
+                        # Kill the whole process tree: proc.kill() only terminates the
+                        # immediate shell, leaving orphaned children (e.g. powershell or
+                        # curl spawned by the command) alive and writing to the temp files.
+                        try:
+                            subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                                           capture_output=True, timeout=5, check=False,
+                                           creationflags=subprocess.CREATE_NO_WINDOW)
+                        except Exception:
+                            proc.kill()
                         proc.wait()
                         raise
                     stdout.seek(0, os.SEEK_END)
@@ -1870,8 +2070,8 @@ def do_replacer(trigger_name, cmd_type, value):
                 log("Shell command timed out (3s)")
                 shell_error = "command timed out after 3s"
             except Exception as e:
-                log(f"Shell command failed: {e}")
-                shell_error = str(e)[:120]
+                log(f"Shell command failed: {_redact_secrets(str(e))}")
+                shell_error = _redact_secrets(str(e))[:120]
 
         if replacement:
             if abort_event.is_set():
@@ -1897,8 +2097,8 @@ def do_replacer(trigger_name, cmd_type, value):
                 _notify_debounced(f"{prefix}{trigger_name} produced no text.", NIIF_WARNING)
 
         time.sleep(0.2)
-        if prev_clip:
-            set_clipboard_silent(prev_clip)
+        if prev_clip is not None or prev_extra:
+            set_clipboard_silent(prev_clip or "", prev_extra)
     except Exception as e:
         log(f"Replacer failed: {e}")
         _notify_debounced(f"{prefix}{trigger_name} failed.", NIIF_ERROR)
@@ -1947,7 +2147,7 @@ def process_keystroke(vkey, scan_code):
         keystroke_buffer.clear()
 
 def _process_keystroke_inner(vkey, scan_code):
-    global last_fg_hwnd, last_keystroke_time
+    global last_fg_hwnd, last_keystroke_time, last_typed_vkey, last_typed_vkey_time
 
     # Clear buffer on window change (prevents cross-app trigger firing)
     current_fg = user32.GetForegroundWindow()
@@ -1965,6 +2165,13 @@ def _process_keystroke_inner(vkey, scan_code):
     if vkey == 0x08:
         if keystroke_buffer:
             keystroke_buffer.pop()
+        return
+
+    # While a transform is running, ignore key auto-repeat. Windows repeats a held key's
+    # WM_KEYDOWNs (raw input included) ~30-500ms apart; holding the trigger's last char
+    # (e.g. the 'x' in ?fix) would otherwise abort the transform and steal the result to
+    # the clipboard. A genuinely new key is a different vkey and still aborts normally.
+    if processing and vkey == last_typed_vkey and (time.time() - last_typed_vkey_time) < 0.6:
         return
 
     # Enter/Escape/Tab - clear buffer
@@ -2066,6 +2273,8 @@ def _process_keystroke_inner(vkey, scan_code):
 
     if best_trigger and not processing:
         keystroke_buffer.clear()
+        last_typed_vkey = vkey
+        last_typed_vkey_time = time.time()
         handle_trigger(best_trigger)
 
 # --- Window procedure ---
@@ -2085,6 +2294,26 @@ def wnd_proc(hwnd, msg, wparam, lparam):
                             pass
                         elif raw.keyboard.Message == WM_KEYDOWN or raw.keyboard.Message == WM_SYSKEYDOWN:
                             process_keystroke(raw.keyboard.VKey, raw.keyboard.MakeCode)
+
+        elif msg == WM_TRAYICON:
+            if lparam == WM_RBUTTONUP:
+                # Context menu with the app's only exit path. SetForegroundWindow is
+                # required for the menu to dismiss when the user clicks elsewhere.
+                user32.SetForegroundWindow(hwnd)
+                hmenu = user32.CreatePopupMenu()
+                if hmenu:
+                    user32.AppendMenuW(hmenu, MF_STRING, MENU_ID_EXIT, "Exit SwiftSlate")
+                    pt = wt.POINT()
+                    user32.GetCursorPos(ctypes.byref(pt))
+                    cmd = user32.TrackPopupMenu(hmenu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                                                pt.x, pt.y, 0, hwnd, None)
+                    user32.DestroyMenu(hmenu)
+                    if cmd == MENU_ID_EXIT:
+                        log("Exit requested from tray menu")
+                        user32.DestroyWindow(hwnd)  # WM_DESTROY -> PostQuitMessage
+            elif lparam == WM_LBUTTONDBLCLK:
+                log(f"Tray double-click (running: {provider}, {model})")
+                notify("SwiftSlate", f"Running — {provider} / {model}", NIIF_INFO)
 
         elif msg == WM_DESTROY:
             user32.PostQuitMessage(0)

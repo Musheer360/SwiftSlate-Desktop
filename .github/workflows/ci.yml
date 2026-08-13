@@ -20,7 +20,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install ruff pyflakes
+          pip install 'ruff<1' pyflakes
 
       - name: Syntax check
         run: python -m py_compile SwiftSlate.pyw
@@ -41,3 +41,38 @@ jobs:
         #           SIM115 (lock/log file handles must stay open),
         #           S310 (urllib HTTP client flagged as URL audit — false positive)
         run: ruff check --select F,E9,B,UP024,UP041,PLW1510 SwiftSlate.pyw
+
+      - name: Verify installer hashes match files
+        run: |
+          for f in SwiftSlate.pyw commands.json; do
+            actual=$(sha256sum "$f" | awk '{print toupper($1)}')
+            pinned=$(grep -oP "\"$f\"\s*=\s*\"\K[0-9A-F]{64}" install.ps1 | head -1)
+            if [ -z "$pinned" ] || [ "$actual" != "$pinned" ]; then
+              echo "::error::$f hash mismatch: file is $actual, installer pins $pinned. Update the hash in install.ps1 in this commit (install the pre-commit hook with 'git config core.hooksPath .githooks' to keep pins in sync automatically)."
+              exit 1
+            fi
+            echo "$f: hash OK"
+          done
+
+      - name: Verify Python runtime pin
+        run: |
+          ver=$(grep -oP '\$pythonVersion\s*=\s*"\K[0-9.]+' install.ps1 | head -1)
+          pin=$(grep -oP '"python\.zip"\s*=\s*"\K[0-9A-F]{64}' install.ps1 | head -1)
+          [ -n "$ver" ] || { echo "::error::install.ps1 is missing \$pythonVersion"; exit 1; }
+          [ -n "$pin" ] || { echo "::error::install.ps1 is missing the python.zip pin"; exit 1; }
+          [ ${#pin} -eq 64 ] || { echo "::error::python.zip pin must be 64 hex chars, got '$pin'"; exit 1; }
+          code=$(curl -s -o /dev/null -w "%{http_code}" "https://www.python.org/ftp/python/$ver/python-$ver-embed-amd64.zip")
+          [ "$code" = "200" ] || { echo "::error::embeddable zip for Python $ver is not available (HTTP $code)"; exit 1; }
+          echo "python.zip pin OK ($ver)"
+
+      - name: Verify stdlib-only imports
+        run: |
+          python -c "import ast,sys,pathlib; t=ast.parse(pathlib.Path('SwiftSlate.pyw').read_text(encoding='utf-8')); m=set()
+          for n in ast.walk(t):
+              if isinstance(n,ast.Import): m|={a.name.split('.')[0] for a in n.names}
+              elif isinstance(n,ast.ImportFrom) and n.level==0 and n.module: m.add(n.module.split('.')[0])
+          bad=sorted(m-set(sys.stdlib_module_names)); assert not bad, 'non-stdlib imports: %s'%bad"
+          echo "imports OK"
+
+      - name: PowerShell syntax check
+        run: pwsh -NoProfile -Command '$errs = $null; [System.Management.Automation.Language.Parser]::ParseFile("install.ps1", [ref]$null, [ref]$errs) > $null; if ($errs.Count) { $errs | ForEach-Object { Write-Host $_.Message }; exit 1 } else { Write-Host "install.ps1 parses OK" }'

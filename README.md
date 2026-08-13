@@ -112,14 +112,19 @@ Edit your config or commands file and changes apply within 2 seconds — no rest
 ### One-Line Install
 
 ```powershell
+irm https://cdn.jsdelivr.net/gh/Musheer360/SwiftSlate-Desktop@master/install.ps1 | iex
+```
+
+If that fails, use the GitHub raw mirror:
+
+```powershell
 irm https://raw.githubusercontent.com/Musheer360/SwiftSlate-Desktop/master/install.ps1 | iex
 ```
 
-If that fails, use the CDN mirror:
-
-```powershell
-irm https://cdn.jsdelivr.net/gh/Musheer360/SwiftSlate-Desktop@master/install.ps1 | iex
-```
+> [!NOTE]
+> After a release, the jsDelivr CDN can serve the previous version for up to ~12 hours. If an update reports the old version, re-run using the GitHub raw mirror above.
+>
+> Run the installer in a normal (non-admin) window. Uninstalling removes everything, including `config.json` and `commands.json` (the installer asks for confirmation first).
 
 The installer handles everything — downloads a portable Python runtime if needed, sets up the config, and optionally adds to startup.
 
@@ -130,10 +135,10 @@ Run the same command again to **update** or **uninstall**.
 | Requirement | Details |
 |:------------|:--------|
 | **Windows** | Windows 10 or 11 (64-bit) |
-| **API Key** | Free Gemini key at [aistudio.google.com](https://aistudio.google.com/api-keys), or Groq at [console.groq.com/keys](https://console.groq.com/keys), or any OpenAI-compatible provider. *Not required for text replacer commands.* |
+| **API Key** | Free Gemini key at [aistudio.google.com](https://aistudio.google.com/api-keys), or Groq at [console.groq.com/keys](https://console.groq.com/keys), or any OpenAI-compatible provider. Text replacer commands don't consume a key, but the app requires at least one API key in `config.json` to start. |
 
 > [!NOTE]
-> Python is **not** required on your system. If not found, the installer downloads an embedded Python runtime (~15 MB) that lives entirely inside the `.swiftslate` folder.
+> Python is **not** required on your system. If not found, the installer downloads an embedded Python runtime (~11 MB) that lives entirely inside the `.swiftslate` folder.
 
 <br>
 
@@ -196,7 +201,7 @@ SwiftSlate supports multiple API keys with intelligent rotation:
 | **Round-Robin Rotation** | Keys are used in turn to spread usage evenly |
 | **Rate-Limit Handling** | If a key gets rate-limited (HTTP 429), SwiftSlate tracks the cooldown and skips it automatically |
 | **Invalid Key Detection** | Keys returning 401/403 errors are marked invalid and excluded from rotation |
-| **Automatic Retry** | Transient network errors retry once after 1 second; server errors rotate to the next key |
+| **Automatic Retry** | Transient network errors wait 1 second before retrying (per attempt); server errors rotate to the next key |
 
 > [!TIP]
 > Adding **2–3 API keys** helps avoid rate limits during heavy use.
@@ -330,7 +335,7 @@ This runs in the foreground with full logging — shows every keystroke match, A
 | 📖 | **Open Source** | The entire codebase is open for inspection under the MIT License. |
 | 🔑 | **Permissions** | Runs as a standard user process — no admin/elevated privileges required. |
 | 📋 | **Clipboard Safety** | SwiftSlate marks clipboard data it writes to avoid history/cloud sync where Windows honors those flags. Reading an active field requires Windows copy/paste automation, so sensitive fields may still be handled by the target app's normal clipboard path. |
-| ✅ | **Installer Integrity** | `install.ps1` verifies the SHA-256 of `SwiftSlate.pyw`, `commands.json`, and the embedded Python runtime against hashes pinned in the script before installing them, across every download channel (GitHub raw, jsDelivr, GitHub API). A mismatch is rejected rather than installed. |
+| ✅ | **Installer Integrity** | `install.ps1` pins the SHA-256 of `SwiftSlate.pyw`, `commands.json`, and the embedded Python runtime; CI fails the build if an app-file pin goes stale. Files are downloaded CDN-first (jsDelivr) with a GitHub raw fallback; a hash mismatch is rejected rather than installed. |
 
 <br>
 
@@ -348,6 +353,8 @@ This runs in the foreground with full logging — shows every keystroke match, A
 </table>
 
 > **Zero third-party dependencies** — uses only Python standard library and Windows APIs via ctypes.
+>
+> The installer's embedded runtime has `site` disabled, so SwiftSlate must stay pip-free.
 
 <br>
 

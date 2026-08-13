@@ -7,7 +7,7 @@ Thanks for wanting to contribute! Here's everything you need to know.
 - **Zero external dependencies** — uses only Python standard library and Windows APIs via ctypes
 - **Single file** — the entire app is one `SwiftSlate.pyw` file, keep it that way
 - **Lightweight** — blocking message loop with zero CPU when idle
-- **Privacy first** — no analytics, no telemetry, no data leaves the machine except to the user's configured AI provider
+- **Privacy first** — no analytics, no telemetry, no data leaves the machine except to the user's configured AI provider (and the built-in `?ip` command, which contacts ifconfig.me)
 
 ## Development Setup
 
@@ -23,6 +23,19 @@ python SwiftSlate.pyw --debug
 ```
 
 Debug mode runs in the foreground with full logging.
+
+### Installer hash pins (one-time setup)
+
+`install.ps1` pins the SHA-256 of `SwiftSlate.pyw` and `commands.json`, and CI fails
+the build if a pin goes stale. A pre-commit hook keeps the pins in sync automatically,
+so you never touch hashes manually:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+After that, commits just work — the hook updates the pin in `install.ps1` and stages it
+whenever either file changes.
 
 ## What You Can Contribute
 
@@ -53,11 +66,12 @@ Key behaviors to understand before touching core code:
 - **Buffer clears** on window change, navigation keys, Enter, Escape, Tab
 - **Spinner animation** appends to original text (e.g., `how r u ◐`)
 - **Clipboard operations** use exclusion flags to avoid polluting Windows clipboard history
-- **DO NOT** add `argtypes` to `DefWindowProcW` or change WNDPROC return type — breaks on Python 3.14
 
 ## Testing Guidelines
 
-Since there's no test suite, manual testing is critical:
+There's a small pure-logic regression suite in `tests/` (run with
+`python -m unittest discover -s tests -v`), plus CI (syntax check, pyflakes, ruff).
+Most behavior is Windows-only, so manual testing is critical:
 
 1. **Run in debug mode** — `python SwiftSlate.pyw --debug`
 2. **Test trigger detection** — type triggers in Notepad, browser, VS Code, Teams
@@ -65,7 +79,7 @@ Since there's no test suite, manual testing is critical:
 4. **Check the undo command** — `?undo` should restore previous text
 5. **Verify clipboard restoration** — after a transform, Ctrl+V should paste what was there before
 6. **Test hot reload** — edit config.json or commands.json while running
-7. **Test singleton** — try launching a second instance (should exit silently)
+7. **Test singleton** — try launching a second instance (it shows an "already running" message box and exits)
 
 ## Code Style
 
@@ -88,7 +102,7 @@ Since there's no test suite, manual testing is critical:
 - Changes that require admin/elevated privileges
 - Features that collect user data or add telemetry
 - Code that splits the app into multiple files unnecessarily
-- Changes to ctypes/WNDPROC declarations that haven't been tested on Python 3.14
+- Changes to ctypes/WNDPROC signatures that aren't verified on the Python version you target
 
 ## Questions?
 
