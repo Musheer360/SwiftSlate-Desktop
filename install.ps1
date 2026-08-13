@@ -384,6 +384,7 @@ try {
         Start-Process $pythonwExe -ArgumentList "`"$(Join-Path $installDir 'SwiftSlate.pyw')`"" -WorkingDirectory $installDir
         Write-Host "  Started." -ForegroundColor Green
     }
+    Write-Host ""
 } catch {
     Write-Host ""
     Write-Host "  Installer failed: $($_.Exception.Message)" -ForegroundColor Red
