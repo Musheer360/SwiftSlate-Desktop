@@ -87,6 +87,28 @@ function Read-SecureKey {
     finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
 }
 
+# --- Read the provider's model catalog from the downloaded app file itself ---
+# Single source of truth: no hardcoded model names to drift. Returns @() if the
+# catalog can't be parsed, in which case the app's own defaults are used.
+function Get-ProviderModels {
+    param([string]$PywPath, [string]$Provider)
+    $dictName = if ($Provider -eq "groq") { "GROQ_MODEL_PARAMS" } else { "GEMINI_MODEL_PARAMS" }
+    try {
+        $text = [IO.File]::ReadAllText($PywPath)
+        $block = [regex]::Match(
+            $text,
+            "$dictName\s*=\s*\{(?<body>.*?)\n\}",
+            [Text.RegularExpressions.RegexOptions]::Singleline
+        )
+        if (-not $block.Success) { return @() }
+        # Model entries are dicts ("name": {...}); inner keys are strings/bools.
+        return @([regex]::Matches($block.Groups["body"].Value, '"([^"]+)":\s*\{') |
+            ForEach-Object { $_.Groups[1].Value })
+    } catch {
+        return @()
+    }
+}
+
 # --- Smoke test: does the runtime actually execute? ---
 function Test-Runtime {
     param([string]$PythonExe)
@@ -150,6 +172,28 @@ function Get-Pythonw {
     }
     Write-Host "  Python runtime ready." -ForegroundColor DarkGray
     return $pywExe
+}
+
+# --- Let the user pick a model from the catalog read out of the app file ---
+function Select-Model {
+    param([string]$Provider)
+    $models = @(Get-ProviderModels (Join-Path $installDir "SwiftSlate.pyw") $Provider)
+    if ($models.Count -eq 0) {
+        # Catalog unreadable — let the app use its own default.
+        return $null
+    }
+    Write-Host ""
+    for ($i = 0; $i -lt $models.Count; $i++) {
+        $defaultMark = if ($i -eq 0) { " (default)" } else { "" }
+        Write-Host "  [$($i + 1)] $($models[$i])$defaultMark" -ForegroundColor White
+    }
+    Write-Host ""
+    $choice = Read-Host "  Model [default: 1]"
+    $idx = 0
+    if ([int]::TryParse($choice, [ref]$idx) -and $idx -ge 1 -and $idx -le $models.Count) {
+        return $models[$idx - 1]
+    }
+    return $models[0]
 }
 
 # --- Main ---
@@ -252,6 +296,7 @@ try {
             Write-Host "  Key: https://console.groq.com/keys" -ForegroundColor Yellow
             Write-Host ""
             $cfg.api_keys = @(Read-SecureKey "  API Key")
+            $cfg.model = Select-Model "groq"
         } elseif ($prov -eq "3") {
             $cfg.provider = "custom"
             Write-Host ""
@@ -260,11 +305,16 @@ try {
             $key = Read-SecureKey "  API Key (Enter to skip)"
             if ([string]::IsNullOrWhiteSpace($key)) { $key = "none" }
             $cfg.api_keys = @($key)
+            Write-Host ""
+            $model = Read-Host "  Model name (Enter for default)"
+            if ([string]::IsNullOrWhiteSpace($model)) { $model = "default" }
+            $cfg.model = $model
         } else {
             Write-Host ""
             Write-Host "  Key: https://aistudio.google.com/api-keys" -ForegroundColor Yellow
             Write-Host ""
             $cfg.api_keys = @(Read-SecureKey "  API Key")
+            $cfg.model = Select-Model "gemini"
         }
 
         if ([string]::IsNullOrWhiteSpace([string]$cfg.api_keys[0]) -and $cfg.provider -ne "custom") {
