@@ -112,17 +112,17 @@ Edit your config or commands file and changes apply within 2 seconds — no rest
 ### One-Line Install
 
 ```powershell
-irm https://cdn.jsdelivr.net/gh/Musheer360/SwiftSlate-Desktop@master/install.ps1 | iex
-```
-
-If that fails, use the GitHub raw mirror:
-
-```powershell
 irm https://raw.githubusercontent.com/Musheer360/SwiftSlate-Desktop/master/install.ps1 | iex
 ```
 
+If that fails, use the jsDelivr CDN mirror:
+
+```powershell
+irm https://cdn.jsdelivr.net/gh/Musheer360/SwiftSlate-Desktop@master/install.ps1 | iex
+```
+
 > [!NOTE]
-> After a release, the jsDelivr CDN can serve the previous version for up to ~12 hours. If an update reports the old version, re-run using the GitHub raw mirror above.
+> After a release, the jsDelivr CDN can serve the previous version for up to ~12 hours. If an update reports the old version, re-run using the GitHub raw command above.
 >
 > Run the installer in a normal (non-admin) window. Uninstalling removes everything, including `config.json` and `commands.json` (the installer asks for confirmation first).
 

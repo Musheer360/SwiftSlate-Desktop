@@ -1,6 +1,7 @@
 # SwiftSlate Desktop
 # https://github.com/Musheer360/SwiftSlate-Desktop
-# irm https://cdn.jsdelivr.net/gh/Musheer360/SwiftSlate-Desktop@master/install.ps1 | iex
+# irm https://raw.githubusercontent.com/Musheer360/SwiftSlate-Desktop/master/install.ps1 | iex
+# (CDN mirror: irm https://cdn.jsdelivr.net/gh/Musheer360/SwiftSlate-Desktop@master/install.ps1 | iex)
 
 # --- Locations ---
 $installDir = Join-Path $env:USERPROFILE ".swiftslate"
