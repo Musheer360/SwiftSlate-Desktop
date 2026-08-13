@@ -10,8 +10,10 @@ $startupDir = [Environment]::GetFolderPath("Startup")
 $shortcutPath = Join-Path $startupDir "SwiftSlate Desktop.lnk"
 
 # --- Download sources ---
-$repoCdn = "https://cdn.jsdelivr.net/gh/Musheer360/SwiftSlate-Desktop@master"      # fast, may lag pushes ~12h
-$repoRaw = "https://raw.githubusercontent.com/Musheer360/SwiftSlate-Desktop/master" # always fresh
+# Raw is always tried first: it never caches, so it always serves the latest push.
+# jsDelivr is the fallback: fast, but can lag a push by up to ~12 hours.
+$repoRaw = "https://raw.githubusercontent.com/Musheer360/SwiftSlate-Desktop/master"
+$repoCdn = "https://cdn.jsdelivr.net/gh/Musheer360/SwiftSlate-Desktop@master"
 $pythonVersion = "3.13.15"
 $pythonZipUrl = "https://www.python.org/ftp/python/$pythonVersion/python-$pythonVersion-embed-amd64.zip"
 # "3.13.15" -> "313" for python313.dll / python313.zip (major.minor only)

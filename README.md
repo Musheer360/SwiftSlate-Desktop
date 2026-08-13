@@ -335,7 +335,7 @@ This runs in the foreground with full logging — shows every keystroke match, A
 | 📖 | **Open Source** | The entire codebase is open for inspection under the MIT License. |
 | 🔑 | **Permissions** | Runs as a standard user process — no admin/elevated privileges required. |
 | 📋 | **Clipboard Safety** | SwiftSlate marks clipboard data it writes to avoid history/cloud sync where Windows honors those flags. Reading an active field requires Windows copy/paste automation, so sensitive fields may still be handled by the target app's normal clipboard path. |
-| ✅ | **Installer Integrity** | `install.ps1` pins the SHA-256 of `SwiftSlate.pyw`, `commands.json`, and the embedded Python runtime; CI fails the build if an app-file pin goes stale. Files are downloaded CDN-first (jsDelivr) with a GitHub raw fallback; a hash mismatch is rejected rather than installed. |
+| ✅ | **Installer Integrity** | `install.ps1` pins the SHA-256 of `SwiftSlate.pyw`, `commands.json`, and the embedded Python runtime; CI fails the build if an app-file pin goes stale. Files are downloaded from GitHub raw first (no caching) with a jsDelivr CDN fallback; a hash mismatch is rejected rather than installed. |
 
 <br>
 
