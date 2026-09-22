@@ -296,6 +296,143 @@ GEMINI_MODEL_PARAMS = {
 DEFAULT_GROQ_MODEL = "openai/gpt-oss-120b"
 DEFAULT_GEMINI_MODEL = "gemini-3.5-flash-lite"
 
+# Ids known to be withdrawn/decommissioned by the provider — these must always migrate
+# to the default rather than pass through, because requests with them always fail.
+# Mirrors Android's GeminiModels.RETIRED_IDS / GroqModels.RETIRED_IDS. Ids NOT listed
+# here but also absent from GEMINI_MODEL_PARAMS/GROQ_MODEL_PARAMS are assumed to be
+# valid ids the live catalog knows about (see fetch_live_models below) and are kept
+# verbatim with no special reasoning/thinking params.
+GEMINI_RETIRED_IDS = {"gemini-2.5-flash-lite"}
+GROQ_RETIRED_IDS = {
+    "llama-3.3-70b-versatile",
+    "llama-4-scout",
+    "meta-llama/llama-4-scout-17b-16e-instruct",
+}
+# Groq's /models endpoint also lists non-chat models (transcription, TTS, safety
+# classifiers) that cannot run text-transforming chat completions. Mirrors Android's
+# GroqModels.NON_CHAT_SUBSTRINGS.
+GROQ_NON_CHAT_SUBSTRINGS = ("whisper", "-tts", "guard", "playai", "orpheus")
+
+# --- Live model catalog (mirrors Android's ProviderModelsCache / issue #148) ---
+# Session-only cache: fetched at most once per process per provider, keyed by
+# provider name. Never written to disk — a stale catalog must not outlive this run.
+_live_model_cache = {}  # provider -> {"models": [...], "attempted": bool}
+_live_model_cache_lock = threading.Lock()
+
+def _parse_gemini_models_json(body):
+    """Extracts chat-capable model ids from a v1beta/models response page.
+    Mirrors Android's GeminiClient.parseModelsJson: entries are kept when either
+    supportedGenerationMethods or supportedActions names "generateContent"; entries
+    with neither array are kept (fail-open). Strips the "models/" prefix."""
+    try:
+        data = json.loads(body)
+        arr = data.get("models") if isinstance(data, dict) else None
+        if not isinstance(arr, list):
+            return [], data if isinstance(data, dict) else {}
+        out = []
+        seen = set()
+        for obj in arr:
+            if not isinstance(obj, dict):
+                continue
+            methods = obj.get("supportedGenerationMethods")
+            actions = obj.get("supportedActions")
+            if isinstance(methods, list) or isinstance(actions, list):
+                supports_chat = ("generateContent" in (methods or [])) or ("generateContent" in (actions or []))
+                if not supports_chat:
+                    continue
+            name = str(obj.get("name") or "").strip()
+            if not name:
+                continue
+            model_id = name[len("models/"):] if name.startswith("models/") else name
+            if model_id not in seen:
+                seen.add(model_id)
+                out.append(model_id)
+        return out, data
+    except (ValueError, AttributeError, TypeError):
+        return [], {}
+
+def _fetch_gemini_models(key):
+    """GET v1beta/models, paginated, for the given API key. Returns a list of chat-
+    capable model ids, or None on failure. Mirrors Android's GeminiClient.fetchModels."""
+    collected = []
+    seen = set()
+    page_token = None
+    for _ in range(3):  # MAX_LIST_PAGES, matches Android — bounds a hostile/broken loop
+        suffix = f"&pageToken={urllib.parse.quote(page_token, safe='')}" if page_token else ""
+        url = f"https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000{suffix}"
+        req = urllib.request.Request(url, headers={
+            "x-goog-api-key": key,
+            "User-Agent": "SwiftSlate/1.0",
+        }, method="GET")
+        try:
+            with _secure_opener.open(req, timeout=15) as resp:
+                body = _read_response_bounded(resp).decode("utf-8", "replace")
+        except Exception as e:
+            log(f"Live model fetch (gemini) failed: {e}")
+            return None
+        ids, data = _parse_gemini_models_json(body)
+        for i in ids:
+            if i not in seen:
+                seen.add(i)
+                collected.append(i)
+        page_token = data.get("nextPageToken") if isinstance(data, dict) else ""
+        if not page_token:
+            break
+    return collected
+
+def _fetch_groq_models(key):
+    """GET the OpenAI-compatible /models endpoint for Groq. Returns a list of
+    chat-capable model ids (non-chat entries filtered out), or None on failure.
+    Mirrors Android's OpenAICompatibleClient.fetchModels + GroqModels.isChatCandidate."""
+    url = "https://api.groq.com/openai/v1/models"
+    req = urllib.request.Request(url, headers={
+        "Authorization": f"Bearer {key}",
+        "User-Agent": "SwiftSlate/1.0",
+    }, method="GET")
+    try:
+        with _secure_opener.open(req, timeout=15) as resp:
+            body = _read_response_bounded(resp).decode("utf-8", "replace")
+    except Exception as e:
+        log(f"Live model fetch (groq) failed: {e}")
+        return None
+    try:
+        data = json.loads(body)
+        arr = data.get("data") if isinstance(data, dict) else None
+        if not isinstance(arr, list):
+            return []
+        ids = []
+        seen = set()
+        for obj in arr:
+            if not isinstance(obj, dict):
+                continue
+            model_id = str(obj.get("id") or obj.get("name") or obj.get("model") or "").strip()
+            if model_id and model_id not in seen:
+                seen.add(model_id)
+                ids.append(model_id)
+        return [i for i in ids if not any(s in i.lower() for s in GROQ_NON_CHAT_SUBSTRINGS)]
+    except (ValueError, AttributeError, TypeError) as e:
+        log(f"Live model fetch (groq) parse error: {e}")
+        return []
+
+def fetch_live_models(provider_name, key, force=False):
+    """Fetch (or return the cached) live model catalog for `provider_name` ('gemini' or
+    'groq'). At most one real network fetch happens per process per provider unless
+    `force=True` — mirrors Android's "attempted" flag so entering Settings again (here:
+    each hot-reload) never re-fires it automatically. Returns a list (possibly empty on
+    failure, in which case the previous cached list — if any — is kept)."""
+    if provider_name not in ("gemini", "groq"):
+        return []
+    with _live_model_cache_lock:
+        cached = _live_model_cache.get(provider_name)
+        if cached and cached["attempted"] and not force:
+            return cached["models"]
+    fetched = _fetch_gemini_models(key) if provider_name == "gemini" else _fetch_groq_models(key)
+    with _live_model_cache_lock:
+        prev = _live_model_cache.get(provider_name)
+        models = fetched if fetched else (prev["models"] if prev else [])
+        _live_model_cache[provider_name] = {"models": models, "attempted": True}
+        return models
+
 # Pre-allocated buffers for keystroke processing
 key_state = (ctypes.c_ubyte * 256)()
 char_buffer = ctypes.create_unicode_buffer(4)
@@ -562,20 +699,35 @@ def load_config():
             notify("SwiftSlate", "Endpoint uses HTTP, not HTTPS. API key is sent unencrypted.", NIIF_WARNING)
 
     # Coerce the model to one the ACTIVE provider actually offers. Mirrors Android's
-    # GroqModels.sanitize()/GeminiModels.sanitize(), whose stated job is migrating users
-    # off retired model ids. Must run after the provider fallbacks above, since those can
-    # change which catalog applies. Without this, a config left pointing at a removed
-    # model — or at the other provider's model after editing "provider" by hand — sends
-    # an unknown id on every request and every transform fails with an opaque API error.
+    # GroqModels.sanitize()/GeminiModels.sanitize(): a known-retired id always migrates
+    # to the default (requests with it always fail). An id that is merely absent from
+    # the curated GROQ_MODEL_PARAMS/GEMINI_MODEL_PARAMS table is checked against the
+    # provider's live /models catalog (issue #148 parity) before falling back — this
+    # lets a model added by the provider after this app shipped be used immediately,
+    # exactly like Android's dynamic Settings dropdown. Off-catalog models get no
+    # curated reasoning/thinking params (every model accepts that). The live fetch
+    # only runs once per process per provider and needs a key, so it never blocks
+    # startup on a slow/absent network beyond one bounded request.
     # Custom endpoints are exempt: their model names are user-defined by design.
-    if provider == "groq" and model not in GROQ_MODEL_PARAMS:
-        log(f"WARNING: Unknown Groq model '{model}', falling back to {DEFAULT_GROQ_MODEL}")
-        notify("SwiftSlate", f"Unknown model '{model}' - using {DEFAULT_GROQ_MODEL}.", NIIF_WARNING)
+    if provider == "groq" and model in GROQ_RETIRED_IDS:
+        log(f"WARNING: Retired Groq model '{model}', falling back to {DEFAULT_GROQ_MODEL}")
+        notify("SwiftSlate", f"Model '{model}' has been retired - using {DEFAULT_GROQ_MODEL}.", NIIF_WARNING)
         model = DEFAULT_GROQ_MODEL
-    elif provider == "gemini" and model not in GEMINI_MODEL_PARAMS:
-        log(f"WARNING: Unknown Gemini model '{model}', falling back to {DEFAULT_GEMINI_MODEL}")
-        notify("SwiftSlate", f"Unknown model '{model}' - using {DEFAULT_GEMINI_MODEL}.", NIIF_WARNING)
+    elif provider == "gemini" and model in GEMINI_RETIRED_IDS:
+        log(f"WARNING: Retired Gemini model '{model}', falling back to {DEFAULT_GEMINI_MODEL}")
+        notify("SwiftSlate", f"Model '{model}' has been retired - using {DEFAULT_GEMINI_MODEL}.", NIIF_WARNING)
         model = DEFAULT_GEMINI_MODEL
+    elif provider in ("groq", "gemini"):
+        curated = GROQ_MODEL_PARAMS if provider == "groq" else GEMINI_MODEL_PARAMS
+        default_for_provider = DEFAULT_GROQ_MODEL if provider == "groq" else DEFAULT_GEMINI_MODEL
+        if model not in curated:
+            live_models = fetch_live_models(provider, api_keys[0]) if api_keys else []
+            if model in live_models:
+                log(f"Model '{model}' not curated but found in live {provider} catalog - using as-is")
+            else:
+                log(f"WARNING: Unknown {provider} model '{model}', falling back to {default_for_provider}")
+                notify("SwiftSlate", f"Unknown model '{model}' - using {default_for_provider}.", NIIF_WARNING)
+                model = default_for_provider
 
     # Load commands into FRESH containers, then atomically swap the global
     # references at the end. The message-loop thread iterates these dicts on

@@ -236,6 +236,9 @@ All settings live in `%USERPROFILE%\.swiftslate\` and hot-reload automatically:
 | `key_delay` | Milliseconds between dependent keystrokes (default: `200`). Decrease to `100` on fast machines for snappier response, increase to `300` on very slow machines if text replacement glitches. The spinner animation speed automatically scales with this value. |
 | `spinner` | Progress indicator mode: `animated` (default — spinning ◐◓◑◒), `static` (shows `[Processing...]` with zero animation keystrokes — the most reliable option for slow machines), or `off` (no visual feedback). |
 
+> [!TIP]
+> The installer's model prompt fetches the **live** model list from Gemini/Groq using the key you enter, so newly released models show up immediately. If a `model` in `config.json` isn't one of the app's tuned defaults, SwiftSlate checks it against that same live catalog on load (and on every hot-reload) before falling back — so any model your key can access is usable, not just the curated ones. Only models the provider has explicitly retired are always replaced with the default.
+
 <br>
 
 ## 🛠️ Custom Commands
