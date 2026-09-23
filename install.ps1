@@ -24,7 +24,7 @@ $pyTag = (($pythonVersion -split '\.')[0] + ($pythonVersion -split '\.')[1])
 # verified at install time and by CI (URL reachability); bump it whenever $pythonVersion
 # changes. Recompute with: sha256sum <file>  (or `Get-FileHash -Algorithm SHA256` on Windows)
 $hashes = @{
-    "SwiftSlate.pyw" = "DCE0BD60C2DE145368A5975D0D0C1F20CCDD792D68756117FA5831EF49A440DE"
+    "SwiftSlate.pyw" = "D47DB6D68F2C78E8A156339D554BD848571843627ECE756717E350E9D4DEAE30"
     "commands.json"  = "CE38B3C4B48B56BA40B8BD23C58AE873C3B29D78BD8319FA96CEBB923A478E9A"
     "python.zip"     = "D1F04D990AEE1253D8569E8E5104E30FA9F5FA830899F14843448872D936A2CF"
 }
@@ -89,10 +89,12 @@ function Read-SecureKey {
     finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
 }
 
-# --- Read the provider's model catalog from the downloaded app file itself ---
-# Single source of truth: no hardcoded model names to drift. Returns @() if the
-# catalog can't be parsed, in which case the app's own defaults are used.
-function Get-ProviderModels {
+# --- Read the provider's CURATED model catalog from the downloaded app file itself ---
+# Fallback only (no network / no key yet / live fetch failed). Single source of truth
+# for the curated list: no hardcoded model names to drift here in the installer.
+# Returns @() if the catalog can't be parsed, in which case the app's own defaults
+# are used.
+function Get-CuratedModels {
     param([string]$PywPath, [string]$Provider)
     $dictName = if ($Provider -eq "groq") { "GROQ_MODEL_PARAMS" } else { "GEMINI_MODEL_PARAMS" }
     try {
@@ -106,6 +108,38 @@ function Get-ProviderModels {
         # Model entries are dicts ("name": {...}); inner keys are strings/bools.
         return @([regex]::Matches($block.Groups["body"].Value, '"([^"]+)":\s*\{') |
             ForEach-Object { $_.Groups[1].Value })
+    } catch {
+        return @()
+    }
+}
+
+# --- Fetch the LIVE model catalog from the provider using the key just entered ---
+# Mirrors the Android app's dynamic Settings dropdown (issue #148): lists whatever
+# the provider's own /models endpoint currently serves, so newly released models are
+# offered immediately without waiting for an app update. Returns @() on any failure
+# (no network, invalid key, unexpected response) - the caller falls back to the
+# curated list read out of the app file.
+function Get-LiveModels {
+    param([string]$Provider, [string]$ApiKey)
+    if ([string]::IsNullOrWhiteSpace($ApiKey)) { return @() }
+    try {
+        if ($Provider -eq "gemini") {
+            $resp = Invoke-RestMethod -Uri "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1000" `
+                -Headers @{ "x-goog-api-key" = $ApiKey } -Method Get -TimeoutSec 15
+            if (-not $resp.models) { return @() }
+            return @($resp.models | Where-Object {
+                    -not $_.supportedGenerationMethods -or ($_.supportedGenerationMethods -contains "generateContent")
+                } | ForEach-Object { ($_.name -replace '^models/', '') } | Where-Object { $_ } | Select-Object -Unique)
+        } elseif ($Provider -eq "groq") {
+            $resp = Invoke-RestMethod -Uri "https://api.groq.com/openai/v1/models" `
+                -Headers @{ "Authorization" = "Bearer $ApiKey" } -Method Get -TimeoutSec 15
+            if (-not $resp.data) { return @() }
+            $nonChat = @("whisper", "-tts", "guard", "playai", "orpheus")
+            return @($resp.data | ForEach-Object { $_.id } | Where-Object { $_ } |
+                Where-Object { $id = $_; -not ($nonChat | Where-Object { $id.ToLower().Contains($_) }) } |
+                Select-Object -Unique)
+        }
+        return @()
     } catch {
         return @()
     }
@@ -176,14 +210,29 @@ function Get-Pythonw {
     return $pywExe
 }
 
-# --- Let the user pick a model from the catalog read out of the app file ---
+# --- Let the user pick a model: live catalog from the provider first, curated list as fallback ---
 function Select-Model {
-    param([string]$Provider)
-    $models = @(Get-ProviderModels (Join-Path $installDir "SwiftSlate.pyw") $Provider)
-    if ($models.Count -eq 0) {
-        # Catalog unreadable — let the app use its own default.
+    param([string]$Provider, [string]$ApiKey)
+    $curated = @(Get-CuratedModels (Join-Path $installDir "SwiftSlate.pyw") $Provider)
+    Write-Host "  Checking for available models..." -ForegroundColor DarkGray
+    $live = @(Get-LiveModels $Provider $ApiKey)
+
+    if ($live.Count -gt 0) {
+        # Live catalog fetched successfully. Preserve the curated defaults' relative order
+        # first (so the app's recommended/tuned picks stay at the top), then append any
+        # other live model not in that curated set.
+        $ordered = @($curated | Where-Object { $live -contains $_ })
+        $ordered += @($live | Where-Object { $ordered -notcontains $_ })
+        $models = $ordered
+        Write-Host "  Live model list loaded." -ForegroundColor DarkGray
+    } elseif ($curated.Count -gt 0) {
+        Write-Host "  Could not reach the live model list - showing built-in defaults." -ForegroundColor DarkGray
+        $models = $curated
+    } else {
+        # Neither source available — let the app use its own default.
         return $null
     }
+
     Write-Host ""
     for ($i = 0; $i -lt $models.Count; $i++) {
         $defaultMark = if ($i -eq 0) { " (default)" } else { "" }
@@ -298,7 +347,7 @@ try {
             Write-Host "  Key: https://console.groq.com/keys" -ForegroundColor Yellow
             Write-Host ""
             $cfg.api_keys = @(Read-SecureKey "  API Key")
-            $cfg.model = Select-Model "groq"
+            $cfg.model = Select-Model "groq" $cfg.api_keys[0]
         } elseif ($prov -eq "3") {
             $cfg.provider = "custom"
             Write-Host ""
@@ -316,7 +365,7 @@ try {
             Write-Host "  Key: https://aistudio.google.com/api-keys" -ForegroundColor Yellow
             Write-Host ""
             $cfg.api_keys = @(Read-SecureKey "  API Key")
-            $cfg.model = Select-Model "gemini"
+            $cfg.model = Select-Model "gemini" $cfg.api_keys[0]
         }
 
         if ([string]::IsNullOrWhiteSpace([string]$cfg.api_keys[0]) -and $cfg.provider -ne "custom") {
